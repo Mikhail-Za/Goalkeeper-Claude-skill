@@ -47,6 +47,7 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
   repo: "/path/to/target-repo",
   statePath: null,               // optional; the durable state dir. Defaults to <repo>/.goalkeeper (plan.json + contract.json + worklog.md + ESCALATION.md live here)
   contract: { goal },            // OR { goal, items[] }. Goal alone -> the planner decomposes it into items. See templates/contract.schema.json + contract.example.json
+  contractPath: null,            // optional: absolute path to a JSON file { goal, items[] }. Read at init, bypassing the args channel. Use for LARGE explicit contracts (inline args can truncate).
   checkPaths: ["tests/**"],      // write-protected; if the builder edits these, the round is auto-reverted
   caps: {
     maxIterations: 20, maxItemRetries: 3, maxStalls: 3, maxTokens: null,
@@ -68,6 +69,8 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
 ### The contract is the product
 
 `contract` carries the entire definition of "done": a top-level `goal` string and an `items[]` array. **You can pass `{ goal }` alone** and let the PLANNER agent decompose it into items, **or pass `{ goal, items[] }`** with the items written yourself. Each item has an `id`, an optional `priority`, a `description`, an optional `expectedOutput` (the concrete result that proves the item done), an optional `dependsOn` (ids that must pass first), and an objective, machine-runnable `check`. See `templates/contract.schema.json` for the shape and `templates/contract.example.json` for a worked example.
+
+**Three ways to supply the contract.** There are three ways to hand Goalkeeper the contract: (a) **goal only** (`contract: { goal }`), where the planner builds the `items[]` for you; (b) **inline** (`contract: { goal, items[] }`), where you write the items into the call itself; and (c) **`contractPath`**, an absolute path to a JSON file holding the `{ goal, items[] }` object, read at init and never passed through the args channel. The file path is the robust choice for large or fully-explicit contracts, because a big inline contract can be truncated by the workflow arg channel, while a file cannot. The precedence for the working contract is: a persisted contract (on resume, in `.goalkeeper/contract.json`) wins, then the `contractPath` file, then inline `contract.items`, then the planner (goal only). One interaction to note: with `amendContract: true`, a `contractPath` file (if provided) supersedes inline `contract.items`, so prefer the file when amending a large contract too.
 
 **Item fields that shape scheduling:**
 
@@ -196,6 +199,8 @@ Three things are deferred, all sharing the same safety property (a bad round can
 2. **No per-round git worktree yet.** The loop uses snapshot-HEAD plus reset-on-fail on the *live* repo. This preserves the core guarantee — a bad round is reset to `prevGoodHead` — but proper isolated worktrees (which also unlock deferral 1) are deferred pending a check of the Workflow execution lifecycle.
 
 3. **The wall-clock cap is soft.** The scripts cannot read the clock, so there is no hard time limit. The hard backstops that *do* stop a runaway loop are the iteration count and the token budget.
+
+4. **Large inline contracts can be truncated by the workflow arg channel.** A very large explicit `contract.items[]` passed inline can be cut off in transit. For big or fully-explicit contracts, put the contract in a JSON file and pass `contractPath` (or hand in a bare goal and let the planner build it); a file is read straight from disk and never crosses that channel.
 
 ## Hard denylist and kill switch
 

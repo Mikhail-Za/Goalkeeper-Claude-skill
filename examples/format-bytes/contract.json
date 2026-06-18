@@ -1,0 +1,29 @@
+{
+  "goal": "Implement format_bytes(num_bytes) in format_bytes.py at the repo root so the write-protected unittest suite under tests/ passes. Do not edit anything under tests/.",
+  "items": [
+    {
+      "id": "basic-units",
+      "priority": 1,
+      "dependsOn": [],
+      "expectedOutput": "format_bytes returns '0 B', '512 B', '1023 B' below 1 KB and '1.0 KB' / '1.0 MB' / '1.0 GB' at the 1024-power unit boundaries",
+      "check": { "type": "command", "command": "python -m unittest -q tests.test_format_bytes.TestBasic" },
+      "allowTestEdit": false
+    },
+    {
+      "id": "rounding",
+      "priority": 2,
+      "dependsOn": ["basic-units"],
+      "expectedOutput": "format_bytes formats to one decimal place: 1536 -> '1.5 KB', 2560 -> '2.5 KB', 5242880 -> '5.0 MB'",
+      "check": { "type": "command", "command": "python -m unittest -q tests.test_format_bytes.TestRounding" },
+      "allowTestEdit": false
+    },
+    {
+      "id": "error-handling",
+      "priority": 3,
+      "dependsOn": ["basic-units"],
+      "expectedOutput": "format_bytes raises ValueError on None, on negative input, and on non-integer input",
+      "check": { "type": "command", "command": "python -m unittest -q tests.test_format_bytes.TestErrors" },
+      "allowTestEdit": false
+    }
+  ]
+}

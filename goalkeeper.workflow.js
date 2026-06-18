@@ -129,6 +129,7 @@ const STATE_INIT = {
     goal: { type: 'string' },
     replanCount: { type: 'number' },
     critiqueRounds: { type: 'number' },
+    fileContract: { type: 'object', properties: { goal: { type: 'string' }, items: { type: 'array', items: ITEM_SHAPE } } },
     workingTreeDirty: { type: 'boolean' },
     notes: { type: 'string' },
   },
@@ -349,7 +350,10 @@ function initPrompt () {
     '4. WORKING CONTRACT -- if ' + statePath + '/contract.json exists, read it and return its items[], goal, replanCount,',
     '   critiqueRounds. If it does not exist, return items=[], goal="", replanCount=0, critiqueRounds=0.',
     '   All of these MUST round-trip so the anti-spin guards, the mutable contract, and the re-plan/critique caps survive resume.',
-    '5. Report whether the working tree is dirty (git -C "' + repo + '" status --porcelain, ignoring .goalkeeper/).',
+    '5. CONTRACT FILE -- ' + (cfg.contractPath
+      ? ('read the JSON file at "' + cfg.contractPath + '" and return its parsed { goal, items } as fileContract. This lets a caller supply a large explicit contract by FILE instead of through args (which can truncate). If the file is missing or not valid JSON, return fileContract=null and note it.')
+      : 'no contractPath was provided; return fileContract=null.'),
+    '6. Report whether the working tree is dirty (git -C "' + repo + '" status --porcelain, ignoring .goalkeeper/).',
     'Return STATE_INIT. Do not modify source files. Do not run the contract checks.',
   ].join('\n')
 }
@@ -586,15 +590,23 @@ if ((init.startIteration > 0 || passingSet.size > 0) && (!init.items || !init.it
 // Determine the working contract. Precedence:
 //   persisted (init.items) wins on resume, UNLESS the caller explicitly amends (cfg.amendContract);
 //   else a caller-provided contract.items seeds a fresh run; else the planner generates one from the goal.
-goalText = contract.goal || init.goal || ''
+const fileContract = init.fileContract || null
 var seededFromArgs = false
+// goalText follows the SAME source that wins for items (least surprise): resume -> file -> inline -> goal-only.
 if (init.items && init.items.length && !cfg.amendContract) {
-  workingItems = init.items
+  workingItems = init.items                                       // resume: persisted contract wins
+  goalText = init.goal || contract.goal || (fileContract && fileContract.goal) || ''
+} else if (fileContract && fileContract.items && fileContract.items.length) {
+  workingItems = dedupeById(fileContract.items.map(function (it, k) { return normalizeItem(it, (it.priority || k + 1)) }))
+  goalText = fileContract.goal || contract.goal || init.goal || ''
+  seededFromArgs = true                                           // seed from a contract FILE (args.contractPath)
 } else if (contract.items && contract.items.length) {
   workingItems = dedupeById(contract.items.map(function (it, k) { return normalizeItem(it, (it.priority || k + 1)) }))
-  seededFromArgs = true
+  goalText = contract.goal || (fileContract && fileContract.goal) || init.goal || ''
+  seededFromArgs = true                                           // seed from inline args.contract.items
 } else {
-  workingItems = null
+  workingItems = null                                             // -> planner
+  goalText = contract.goal || (fileContract && fileContract.goal) || init.goal || ''
 }
 
 // PLANNING front-end (fable step 1): no items given -> decompose the goal into a contract.

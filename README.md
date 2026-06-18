@@ -86,6 +86,7 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
   autonomy: "envelope",
   repo: "/path/to/your/repo",
   contract: { goal: "Add CSV export to the report page with full test coverage" },
+  contractPath: null,            // optional: absolute path to a JSON file { goal, items[] }. Read at init, bypassing the args channel. Use for LARGE explicit contracts (inline args can truncate).
   checkPaths: ["tests/**"],
   caps: { maxIterations: 20, maxTokens: 500000 },
   denylist: ["git push","deploy","secrets","external-send"]
@@ -107,6 +108,8 @@ contract: {
   ]
 }
 ```
+
+For large or explicit contracts, put the contract in a JSON file and pass `contractPath` (an absolute path) instead of inlining it; the file is read at init and never crosses the args channel, so it cannot be truncated. See [`examples/format-bytes/`](examples/format-bytes/) for a worked example that does exactly this.
 
 See [`templates/`](templates/) for the contract schema and worked examples, and [`SKILL.md`](SKILL.md) for the full argument reference.
 
