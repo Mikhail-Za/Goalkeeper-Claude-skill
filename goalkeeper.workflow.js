@@ -54,10 +54,11 @@ export const meta = {
 // Config (from args, with safe defaults)
 // ----------------------------------------------------------------------------
 let cfg = args || {}
-if (typeof cfg === 'string') {
-  // Some invocation paths deliver args as a JSON string; parse it so the skill is robust to both.
-  try { cfg = JSON.parse(cfg) } catch (e) { cfg = {} }
+// Some invocation paths deliver args as a JSON string, occasionally double-encoded; unwrap until it is an object.
+for (var _p = 0; _p < 4 && typeof cfg === 'string'; _p++) {
+  try { cfg = JSON.parse(cfg) } catch (e) { break }
 }
+if (typeof cfg !== 'object' || cfg === null) cfg = {}
 const mode = cfg.mode || 'build'
 const autonomy = cfg.autonomy || 'envelope'
 const repo = cfg.repo
@@ -77,6 +78,9 @@ const caps = Object.assign(
   cfg.caps || {}
 )
 const roundsThisRun = (autonomy === 'leash') ? (cfg.runRounds || 1) : caps.maxIterations
+// budget.spent() is the SHARED token meter for the whole turn, not just this run. Snapshot it at
+// run start so caps.maxTokens bounds THIS run's spend (the delta), not the cumulative session total.
+const tokenBaseline = (budget && typeof budget.spent === 'function') ? budget.spent() : 0
 
 const j = function (o) { return JSON.stringify(o) }
 function approved (gate) { return approvals.indexOf(gate) >= 0 }
@@ -246,7 +250,7 @@ function computeStall (history) {
 
 function budgetExhausted () {
   if (caps.maxTokens && budget && typeof budget.spent === 'function') {
-    if (budget.spent() >= caps.maxTokens) return true
+    if ((budget.spent() - tokenBaseline) >= caps.maxTokens) return true
   }
   if (budget && budget.total && typeof budget.remaining === 'function') {
     if (budget.remaining() <= 0) return true
@@ -436,18 +440,22 @@ function selfCritiquePrompt (goalText, items) {
 }
 
 function scopeCheckPrompt (goalText, items, passingCnt, iter) {
-  const spent = (budget && typeof budget.spent === 'function') ? budget.spent() : null
+  // Per-RUN token delta (budget.spent() is cumulative across the whole turn, not this run).
+  const spent = (budget && typeof budget.spent === 'function') ? (budget.spent() - tokenBaseline) : null
   return [
     'You are a SCOPE checkpoint for a long autonomous run. Answer briefly and conservatively.',
+    'The repository is at "' + repo + '" and DEFINITELY exists; the builder and verifier operate inside it. Do NOT try to',
+    'locate the repo, glob/find files, or run file-existence checks -- that is not your job, and your working directory may',
+    'differ from the repo. An INDEPENDENT verifier already confirms each item check, so TRUST the progress numbers below.',
+    'Your ONLY job is a high-level judgment about whether continuing is still worthwhile.',
     'GOAL: ' + goalText,
-    'Progress: ' + passingCnt + '/' + items.length + ' items pass after ' + iter + ' rounds.' +
-      (spent !== null ? ' Output tokens spent so far: ' + spent + '.' : ''),
-    'Remaining items: ' + j(items.filter(function (i) { return true }).map(function (i) { return i.id })),
-    'Decide: (a) is the original goal still the right target given what has been built; (b) is finishing the remaining',
-    'work worth the remaining cost; (c) is what is already done good enough to stop here?',
-    'recommendation: "continue" (default -- keep going) | "stop-good-enough" (enough value already delivered) |',
-    '"stop-goal-stale" (goal is no longer the right target) | "escalate" (genuinely unsure, ask the human).',
-    'Default to "continue" unless there is a CLEAR reason to stop. Return SCOPE_CHECK { recommendation, reason, confidence }.',
+    'Progress: ' + passingCnt + '/' + items.length + ' items pass after ' + iter + ' build rounds.' +
+      (spent !== null ? ' THIS run has spent ~' + spent + ' output tokens (not the session total).' : ''),
+    'Decide: (a) is the original goal still the right target; (b) is finishing the remaining work worth the remaining',
+    'cost; (c) is what is already done good enough to stop here?',
+    'recommendation: "continue" (default) | "stop-good-enough" | "stop-goal-stale" | "escalate" (genuinely unsure).',
+    'Default to "continue" unless there is a CLEAR, well-founded reason to stop (a missing/unfindable repo is NOT such a',
+    'reason -- the repo exists). Return SCOPE_CHECK { recommendation, reason, confidence }.',
   ].join('\n')
 }
 
@@ -537,7 +545,14 @@ async function persistContract (counters) {
 // Main
 // ----------------------------------------------------------------------------
 if (!repo) {
-  return { status: 'error', reason: 'bad-input', message: 'goalkeeper requires args.repo.', got: { argsType: typeof args } }
+  return {
+    status: 'error', reason: 'bad-input', message: 'goalkeeper requires args.repo.',
+    got: {
+      argsType: typeof args, cfgType: typeof cfg,
+      cfgKeys: (cfg && typeof cfg === 'object') ? Object.keys(cfg) : null,
+      preview: (typeof args === 'string') ? args.slice(0, 200) : null,
+    },
+  }
 }
 
 phase('Plan')
