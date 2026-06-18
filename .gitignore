@@ -1,0 +1,12 @@
+# Goalkeeper's runtime state is written INSIDE the target repo it operates on
+# (under <target-repo>/.goalkeeper/), never inside this skill repo. This entry
+# is just a safety net in case anyone runs a test from within this folder.
+.goalkeeper/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

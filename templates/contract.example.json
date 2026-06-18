@@ -1,0 +1,65 @@
+{
+  "goal": "Add token-bucket rate limiting to the Express API so each client is capped at N requests per window, with over-limit requests rejected via HTTP 429 and a Retry-After header.",
+  "items": [
+    {
+      "id": "middleware-exists",
+      "priority": 1,
+      "description": "Create the token-bucket rate-limit middleware module that the API can mount.",
+      "expectedOutput": "A new module at src/middleware/rateLimit.js exporting a token-bucket factory (capacity + injected clock source).",
+      "check": {
+        "type": "file_exists",
+        "path": "src/middleware/rateLimit.js"
+      },
+      "dependsOn": [],
+      "allowTestEdit": false
+    },
+    {
+      "id": "unit-tests-pass",
+      "priority": 2,
+      "description": "The token-bucket unit tests (refill rate, burst capacity, per-client isolation) pass.",
+      "expectedOutput": "All token-bucket unit tests green under a fake clock that the bucket reads via an injected clock source.",
+      "check": {
+        "type": "command",
+        "command": "npm test -- rate-limit"
+      },
+      "dependsOn": ["middleware-exists"],
+      "allowTestEdit": false
+    },
+    {
+      "id": "over-limit-returns-429",
+      "priority": 3,
+      "description": "After exhausting the bucket, the next request over the limit is rejected with HTTP 429. The integration test boots the app, fires N+1 requests from one client, and asserts the (N+1)th status is 429.",
+      "expectedOutput": "The (N+1)th request in a single window returns HTTP 429 once the bucket is empty.",
+      "check": {
+        "type": "command",
+        "command": "npm test -- rate-limit.integration"
+      },
+      "dependsOn": ["unit-tests-pass"],
+      "allowTestEdit": false
+    },
+    {
+      "id": "retry-after-header",
+      "priority": 4,
+      "description": "The 429 response includes a Retry-After header telling the client when to retry. Verified by an integration test that inspects the over-limit response headers.",
+      "expectedOutput": "Every 429 response carries a Retry-After header set to the seconds until the next token refills.",
+      "check": {
+        "type": "command",
+        "command": "npm test -- rate-limit.retry-after"
+      },
+      "dependsOn": ["over-limit-returns-429"],
+      "allowTestEdit": false
+    },
+    {
+      "id": "full-suite-green",
+      "priority": 5,
+      "description": "The complete test suite still passes, confirming rate limiting did not regress existing endpoints.",
+      "expectedOutput": "The full test suite passes with zero regressions in pre-existing endpoints.",
+      "check": {
+        "type": "command",
+        "command": "npm test"
+      },
+      "dependsOn": ["retry-after-header"],
+      "allowTestEdit": false
+    }
+  ]
+}
