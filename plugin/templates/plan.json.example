@@ -1,0 +1,22 @@
+{
+  "_comment": "RUNTIME STATE (the durable spine, half 1 of 2). Lives at <repo>/.goalkeeper/plan.json and holds ONLY loop runtime: status, passing, attempts, iteration, prevGoodHead, and fpHistory. The durable WORKING CONTRACT (goal, items, replanCount, critiqueRounds) now lives in a SEPARATE file, contract.json, beside this one; the bookkeeper writes plan.json every round and never touches contract.json. The init step reads BOTH at the start of a run. A fresh `goalkeeper` invocation does NOT start over: it loads this file and resumes by restoring `passing`, `attempts`, `prevGoodHead`, `iteration`, and `fpHistory` (all of these round-trip). From those, the 3-retry, no-progress, and oscillation guards are rebuilt exactly where the last run left off. The script merges these fields verbatim, so keep the keys exactly as named.",
+  "status": "in-progress",
+  "passing": ["middleware-exists", "unit-tests-pass"],
+  "attempts": {
+    "middleware-exists": 0,
+    "unit-tests-pass": 0,
+    "over-limit-returns-429": 3,
+    "retry-after-header": 0,
+    "full-suite-green": 0
+  },
+  "iteration": 6,
+  "prevGoodHead": "9c4f1ab7e2d3590fa18b6c0d4e7a2f3b5c8d9e01",
+  "fpHistory": [
+    { "hash": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678", "pass": 1, "head": "11aa22bb33cc44dd55ee66ff7788990011223344" },
+    { "hash": "b2c3d4e5f60718293a4b5c6d7e8f901234567890", "pass": 1, "head": "11aa22bb33cc44dd55ee66ff7788990011223344" },
+    { "hash": "c3d4e5f60718293a4b5c6d7e8f90123456789012", "pass": 2, "head": "9c4f1ab7e2d3590fa18b6c0d4e7a2f3b5c8d9e01" },
+    { "hash": "d4e5f60718293a4b5c6d7e8f9012345678901234", "pass": 2, "head": "9c4f1ab7e2d3590fa18b6c0d4e7a2f3b5c8d9e01" },
+    { "hash": "e5f60718293a4b5c6d7e8f901234567890123456", "pass": 2, "head": "9c4f1ab7e2d3590fa18b6c0d4e7a2f3b5c8d9e01" },
+    { "hash": "f60718293a4b5c6d7e8f90123456789012345678", "pass": 2, "head": "9c4f1ab7e2d3590fa18b6c0d4e7a2f3b5c8d9e01" }
+  ]
+}

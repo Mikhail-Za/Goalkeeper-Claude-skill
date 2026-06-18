@@ -1,0 +1,6 @@
+{
+  "name": "goalkeeper",
+  "description": "Autonomous build/audit/verify loop that runs until a machine-checkable done-contract passes, with deterministic anti-spin stop conditions and on-disk human escalation.",
+  "version": "1.0.0",
+  "author": { "name": "Mikhail-Za" }
+}

@@ -1,0 +1,176 @@
+# Goalkeeper headless build-or-escalate, as a GitHub Actions workflow.
+#
+# This file is named `goalkeeper.yml.example` ON PURPOSE: GitHub only runs
+# workflow files ending in `.yml` / `.yaml`, so the `.example` suffix means this
+# will NOT auto-run. To use it, copy it to `.github/workflows/goalkeeper.yml`,
+# adapt the parts marked ILLUSTRATIVE, and add the ANTHROPIC_API_KEY secret.
+#
+# What it does: on a manual trigger, it checks out the repo, installs Claude
+# Code, runs the goalkeeper skill headless against a committed contract file,
+# and then either (a) uploads ESCALATION.md and FAILS the job if the run halted,
+# or (b) leaves the new commits on the branch if the run converged. Pushing /
+# opening a PR is intentionally NOT done here: Goalkeeper's denylist forbids
+# `git push`, so moving the work off the runner is the wrapper's job (see the
+# commented "ship the result" step near the bottom).
+#
+# See docs/ci.md in this repository for the full explanation.
+#
+# IMPORTANT. Verify before relying on this:
+#   * The exact `claude -p` flags (especially the permission flags) are
+#     ILLUSTRATIVE. Confirm them with `claude --help` in the runner. See the
+#     "Run Goalkeeper" step below.
+#   * The install command is ILLUSTRATIVE. Confirm the current package /
+#     installer against the Claude Code docs.
+
+name: Goalkeeper (headless build-or-escalate)
+
+# Manual trigger only. This is deliberate for a tool that commits code
+# autonomously: you choose when it runs and on which contract. Do NOT switch
+# this to `push:` / `pull_request:` until you have validated it by hand.
+on:
+  workflow_dispatch:
+    inputs:
+      contract_path:
+        description: "Path to the committed contract JSON (relative to repo root)"
+        required: true
+        default: ".goalkeeper-ci/contract.json"
+      max_tokens:
+        description: "Hard token budget ceiling for the build loop (Goalkeeper caps.maxTokens)"
+        required: true
+        default: "400000"
+
+# Goalkeeper commits to the working tree. `contents: write` is only needed if a
+# later step pushes the result; the run itself commits locally and does not push.
+permissions:
+  contents: write
+
+jobs:
+  goalkeeper:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) Check out the repo WITH history. Goalkeeper commits each item it
+      #    builds, so it needs a real git working tree, not a shallow export.
+      #    fetch-depth: 0 keeps full history; persist-credentials lets a later
+      #    step push if you choose to enable one.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      # 2) Node toolchain. Required for the npm install path below, and many
+      #    contracts run JS/TS test commands as their checks.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # 3) Install Claude Code.
+      #    ILLUSTRATIVE. Confirm the package / installer against current docs.
+      #    Option A (npm, used here):
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+        #  Option B (official native installer, alternative, verify URL):
+        #    run: curl -fsSL https://claude.ai/install.sh | bash
+
+      # 3b) Sanity-check the version. Dynamic workflows (which Goalkeeper drives)
+      #     require Claude Code v2.1.154+. This just prints it for the log; you
+      #     may want to hard-fail if it is older.
+      - name: Show Claude Code version
+        run: claude --version
+
+      # 3c) Install the goalkeeper skill where Claude Code can find it.
+      #     ILLUSTRATIVE. Adjust to how you distribute the skill. If the skill
+      #     is committed into THIS repo at .claude/skills/goalkeeper you can skip
+      #     this. Otherwise clone it into the user skills dir:
+      - name: Install goalkeeper skill
+        run: |
+          git clone https://github.com/Mikhail-Za/Goalkeeper-Claude-skill.git \
+            "$HOME/.claude/skills/goalkeeper"
+
+      # 4) Run Goalkeeper headless.
+      #    The prompt names the skill, points it at the COMMITTED contract via
+      #    contractPath (absolute path, where `${{ github.workspace }}` is the
+      #    checkout root), sets build/envelope, and sets the maxTokens cap.
+      #
+      #    ILLUSTRATIVE FLAGS: the permission handling is the part most likely to
+      #    need adjustment. A fully headless run has no human to approve tool
+      #    calls, so Goalkeeper's nested agents must be pre-authorized or they
+      #    will hang. Two documented approaches, pick and VERIFY one:
+      #      (a) --allowedTools "<list>"  (least privilege; verify the exact list)
+      #      (b) --dangerously-skip-permissions  (blunt; isolated runners ONLY)
+      #    `--dangerously-skip-permissions` is acceptable here because a GitHub
+      #    runner is ephemeral and isolated, but confirm whether the broad
+      #    --allowedTools set is enough first. There is NO `--max-tokens` CLI
+      #    flag; the token ceiling is Goalkeeper's caps.maxTokens, set in the
+      #    prompt below.
+      - name: Run Goalkeeper
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CONTRACT_PATH: ${{ github.workspace }}/${{ inputs.contract_path }}
+          MAX_TOKENS: ${{ inputs.max_tokens }}
+        run: |
+          claude -p "Use the goalkeeper skill to build the feature defined by the \
+          contract at ${CONTRACT_PATH}. Invoke it in build mode with envelope \
+          autonomy. Pass the contract by file: set contractPath to that absolute \
+          path (do NOT inline the contract). Operate on this repository \
+          (${{ github.workspace }}) as the target repo. Set caps.maxTokens to \
+          ${MAX_TOKENS} as a hard budget ceiling. Keep the denylist at its \
+          defaults. Run unattended; do not pause for approval. If the run cannot \
+          converge, let Goalkeeper write ESCALATION.md and stop." \
+            --output-format text \
+            --dangerously-skip-permissions
+          #   ^ ILLUSTRATIVE permission flag, see note above. Prefer a verified
+          #     --allowedTools "Read,Edit,Write,Bash,Workflow" if it suffices.
+
+      # 5) Decide the outcome from Goalkeeper's on-disk state, NOT the exit code.
+      #    The halt signal is the presence of <repo>/.goalkeeper/ESCALATION.md.
+      #    If it exists: the run halted -> upload it and fail the job.
+      #    If it does not: the run converged -> the new commits are on the branch.
+      #    This step always runs so we report the result even if the run errored.
+      - name: Check for escalation and report
+        if: always()
+        run: |
+          ESC="${{ github.workspace }}/.goalkeeper/ESCALATION.md"
+          if [ -f "$ESC" ]; then
+            echo "::error::Goalkeeper HALTED. A human is needed. See ESCALATION.md (uploaded as an artifact)."
+            echo "----- ESCALATION.md -----"
+            cat "$ESC"
+            echo "-------------------------"
+            # Leave a marker for the upload + fail steps below.
+            echo "GOALKEEPER_HALTED=1" >> "$GITHUB_ENV"
+          else
+            echo "No ESCALATION.md found. Goalkeeper converged. New commits (if any) are on the branch:"
+            git log --oneline -n 20
+          fi
+
+      # 6) If halted, upload ESCALATION.md so a reviewer can read it from the run
+      #    summary / on the PR.
+      - name: Upload ESCALATION.md
+        if: always() && env.GOALKEEPER_HALTED == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: goalkeeper-escalation
+          path: ${{ github.workspace }}/.goalkeeper/ESCALATION.md
+          if-no-files-found: warn
+
+      # 7) OPTIONAL. Ship the result on convergence.
+      #    Goalkeeper does NOT push (denylist), so if you want the work moved off
+      #    the runner, do it here with the wrapper's own credentials. Commented
+      #    out by default: enable deliberately once you trust the flow. Example:
+      #
+      # - name: Push the built branch (wrapper, not Goalkeeper)
+      #   if: env.GOALKEEPER_HALTED != '1'
+      #   run: |
+      #     git push origin HEAD
+      #   # Or use a create-pull-request action to open a PR for review instead
+      #   # of pushing directly. Either way this is the WRAPPER's job.
+
+      # 8) Make the job red if Goalkeeper halted. Placed last so the upload above
+      #    still runs. A halted run must fail the job so the PR is clearly blocked.
+      - name: Fail the job if Goalkeeper halted
+        if: always() && env.GOALKEEPER_HALTED == '1'
+        run: |
+          echo "Goalkeeper halted and wrote ESCALATION.md. Failing the job for human review."
+          exit 1

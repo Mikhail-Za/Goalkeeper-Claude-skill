@@ -1,0 +1,7 @@
+{
+  "name": "goalkeeper-marketplace",
+  "owner": { "name": "Mikhail-Za" },
+  "plugins": [
+    { "name": "goalkeeper", "source": "./plugin", "description": "Autonomous build/audit/verify loop until a done-contract passes." }
+  ]
+}

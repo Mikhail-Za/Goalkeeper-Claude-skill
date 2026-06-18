@@ -1,0 +1,12 @@
+# Goalkeeper worklog (append-only)
+
+Format: `round | item-id | outcome | why`
+Outcomes: passed | failed | blocked | revert-tamper | revert-regression
+This is loop memory. Read it before retrying an item so you never repeat a dead approach.
+
+1 | middleware-exists | passed | Created src/middleware/rateLimit.js exporting a token-bucket factory (capacity + refill rate). file_exists check green first try.
+2 | unit-tests-pass | failed | Token bucket refill used wall-clock Date.now() but the unit tests advance a fake clock; the bucket never refilled, so every request drained to empty and the burst/refill cases stayed red.
+3 | unit-tests-pass | passed | Switched refill to an injected clock source (clock.now()); fake-clock advance now refills as expected. `npm test -- rate-limit` green (refill rate, burst capacity, per-client isolation).
+4 | over-limit-returns-429 | revert-regression | Reused the bucket inside the live middleware but mutated module-level state across requests; this regressed the unit suite (state leaked between tests). Reverted to prevGoodHead; net passing stayed 2.
+5 | over-limit-returns-429 | failed | Off-by-one: the limit was compared BEFORE the token decrement, so the (N+1)th request still saw a token and returned 200 instead of 429. `npm test -- rate-limit.integration` red on the boundary assertion.
+6 | over-limit-returns-429 | failed | Switched to decrement-then-compare, which fixes the boundary in isolation, but the integration test still flakes: the harness fires N+1 requests faster than one refill tick, so whether the (N+1)th is 429 depends on timing rather than the limit. Third non-passing round -> hits the 3-retry cap; boundary/timing semantics are ambiguous as written and need a contract decision.

@@ -70,6 +70,26 @@ If Claude Code was already running, restart it so the new skill is picked up. Yo
 
 ---
 
+## Install as a plugin (alternative)
+
+Goalkeeper can also be installed as a Claude Code **plugin** from its built-in marketplace. The two install paths differ only in how the command is named:
+
+- **Copy-folder install (above)** gives you the bare `/goalkeeper` command.
+- **Plugin install** namespaces the command, so it is invoked as `/goalkeeper:goalkeeper`.
+
+To install as a plugin, add the marketplace and then install the plugin from it:
+
+```
+/plugin marketplace add Mikhail-Za/Goalkeeper-Claude-skill
+/plugin install goalkeeper@goalkeeper-marketplace
+```
+
+Everything else (arguments, behavior, the bundled workflow and templates) is identical to the folder install.
+
+**Maintainers.** The `plugin/` folder duplicates the root skill files (`SKILL.md`, `goalkeeper.workflow.js`, and `templates/`) because a plugin cannot reference files outside its own directory. After changing any of the root files, re-sync the copies by running `scripts/sync-plugin` (`scripts/sync-plugin.ps1` on Windows, `scripts/sync-plugin.sh` on macOS / Linux).
+
+---
+
 ## Quick start
 
 Goalkeeper takes a target `repo` and a `contract`. The contract can be a bare goal (the planner builds the rest) or a full list of items.
