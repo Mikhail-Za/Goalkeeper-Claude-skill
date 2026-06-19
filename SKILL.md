@@ -16,6 +16,8 @@ The defining risk this skill addresses is the opposite of laziness. An eager loo
 - **Scope checkpoint.** Every few rounds it steps back and asks "is finishing still worth it?".
 - **Living re-plan.** A builder that discovers the plan is wrong can request the contract be revised mid-run, capped so the plan cannot grow forever.
 
+**Hardware-in-the-loop hardening.** For slow or non-deterministic checks, Goalkeeper adds: `nondeterministic` checks with a retry `passPolicy` (latch / k-of-n) and tree-hash latching, so an environmental miss is never read as a code failure; per-check **shell / cwd / env pinning** (`pwsh`/`bash`/`cmd`/`sh`), so a check runs under exactly the shell it needs; **pipeline checks** (build → deploy → verify) that short-circuit on a failed build and force a fresh build when a stale artifact cannot be ruled out; and a **contract-identity** resume gate, so a different task pointed at a repo with an in-progress run halts (`contract-mismatch`) rather than resuming the wrong work.
+
 These are described in detail below; the contract is therefore mutable and durable, surviving resume.
 
 ## Architecture: three layers
@@ -24,7 +26,7 @@ These are described in detail below; the contract is therefore mutable and durab
 
 **2. The spine is durable on-disk state.** Everything that matters persists under `<repo>/.goalkeeper/`, split across **two files** plus a log:
 
-- `plan.json` — **runtime state only**: `status`, the set of `passing` item ids, per-item `attempts` (retry counts), the current `iteration`, `prevGoodHead` (the last known-green git SHA), and `fpHistory` (the fingerprint history used for no-progress and oscillation detection). The bookkeeper writes this every round.
+- `plan.json` — **runtime state only**: `status`, the set of `passing` item ids, per-item `attempts` (retry counts), the current `iteration`, `prevGoodHead` (the last known-green git SHA), `fpHistory` (the fingerprint history used for no-progress and oscillation detection), and `latched` (the tree-hashes at which a `nondeterministic` check has banked a pass, so a later flaky miss at the same tree does not revert or un-converge the run). The bookkeeper writes this every round, and the latch survives resume.
 - `contract.json` — the **durable working contract**: `goal`, `items` (each with its `expectedOutput`, `check`, and `dependsOn`), and the two spent budgets `replanCount` and `critiqueRounds`. This is the contract the loop is *actually* building to right now, which can differ from what you first handed in (the planner may have generated it, self-critique may have appended items, a re-plan may have split items). It is written only by the planner/seed/re-plan/self-critique persist steps; the bookkeeper never touches it.
 - `worklog.md` — an append-only log of per-round reflections.
 
@@ -80,6 +82,42 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
 
 Write the contract carefully. Goalkeeper is extremely good at converging on whatever you actually wrote, which is exactly why a sloppy contract is dangerous: a perfectly-green run against the wrong checks is worse than a failed run, because it *looks* finished. The spec-review step below exists precisely to catch this before any code is written.
 
+## Check types and capabilities
+
+Each item's `check` is the objective, machine-runnable test the verifier uses to decide pass/fail.
+
+**Base check types** (exactly one payload field, selected by `type`):
+
+- `command`: a shell command; exit 0 passes, non-zero fails. `check: { type: "command", command: "npm test -- export.endpoint" }`
+- `file_exists`: a `path` that must exist. `check: { type: "file_exists", path: "dist/report.csv" }`
+- `grep`: a `pattern` (regex) that must match the file/output at `path`. `check: { type: "grep", path: "src/export.ts", pattern: "text/csv" }`
+- `judge`: a `rubric` an LLM judge applies, for checks that genuinely cannot be a deterministic command. `check: { type: "judge", rubric: "The export escapes embedded commas and quotes per RFC-4180" }`
+
+The following capabilities layer onto these to harden checks that are slow or environment-dependent (a hardware-in-the-loop pass).
+
+**Non-deterministic checks (`nondeterministic` + `passPolicy` + `precondition`).** A check whose pass can depend on an external event, timing, hardware, a peer device, or the network should declare `nondeterministic: true`. The rationale: a PASS proves the code is correct at that code state, while a later MISS at the *same* code state only means the environment did not cooperate that instant, so a single miss must not be read as a code failure. The verifier RETRIES such a check up to `n` times (default `n=3`), running the optional `precondition` command before each attempt, and it passes if it succeeds at least once (`mode: "latch"`, the default) or at least `k` of `n` times (`mode: "k-of-n"`). The engine also **latches the git tree-hash** where the check passed: once latched at a tree, a later flaky miss at that same tree does not revert the round, does not count toward the item-stuck retry counter, and does not un-converge the run at the final suite. A genuinely-wrong item that never passes still escalates via item-stuck. The latch state persists in `plan.json` (a new `latched` field) and survives resume. The adversarial spec-review **requires** an environment-dependent check to carry this declaration: an env-dependent check *without* `nondeterministic: true` is treated as a blocking contract gap, because the loop would otherwise mistake an environmental miss for a code failure.
+
+```js
+check: { type: "command", command: "./scripts/mesh-rx-check.sh", nondeterministic: true,
+         passPolicy: { mode: "k-of-n", k: 2, n: 5 }, precondition: "./scripts/arm-radio.sh" }
+```
+
+**Shell / env pinning (`shell` + `cwd` + `env`).** A check may declare `shell: "pwsh" | "bash" | "cmd" | "sh"`, plus optional `cwd` (default: repo root) and `env`. The verifier and builder run the check command through *that exact* shell, in that cwd, with those env vars set, never their own default shell. On Windows, `shell: "pwsh"` runs under PowerShell (never MSYS / git-bash) and `shell: "cmd"` runs under cmd.exe. This eliminates a class of false failures where a build environment that requires a specific shell (for example a PowerShell setup/`export` script that refuses to run under MSYS) silently broke every check.
+
+```js
+check: { type: "command", command: ".\\build.ps1 && .\\run-tests.ps1",
+         shell: "pwsh", cwd: "firmware", env: { IDF_TARGET: "esp32p4" } }
+```
+
+**Pipeline checks (`type: "pipeline"`).** A check may be `{ type: "pipeline", build, deploy, verify, freshBuild? }`. It runs BUILD first; if the build exits non-zero the check FAILS immediately and deploy/verify do *not* run (never deploy a failed build). Only a clean build proceeds to deploy then verify, and the check passes only if verify passes. `freshBuild: true` forces a clean/reconfigured build; more generally the runner does a clean build whenever it cannot confirm the artifact was rebuilt from current source, so a stale incremental artifact cannot masquerade as a passing (or regressing) deploy.
+
+```js
+check: { type: "pipeline", build: "make -j", deploy: "make flash",
+         verify: "./scripts/on-device-smoke.sh", freshBuild: true }
+```
+
+These capabilities compose: a pipeline check can itself be `nondeterministic` (hardware deploy whose smoke test is flaky) and can pin a `shell`.
+
 ## The workflow phases
 
 A run moves through five phases: **Plan -> Setup -> Loop -> Review -> Escalate**.
@@ -90,7 +128,7 @@ If you pass `{ goal }` with no `items[]`, a **PLANNER** agent decomposes the goa
 
 ### Setup (once)
 
-**Adversarial spec-review.** A critic agent attacks the contract itself, looking for gaps, ambiguity, unmeasurable checks, missing acceptance criteria, and any `dependsOn` that points at a missing id. The contract *is* the product, and the scariest failure mode is converging flawlessly on the wrong target, so the contract gets reviewed before a single line is built. **Blocking gaps halt the run for human input** (`contract-incomplete`) rather than letting Goalkeeper build confidently toward something underspecified, unless you pass `approvals: ["contract-gaps"]`.
+**Adversarial spec-review.** A critic agent attacks the contract itself, looking for gaps, ambiguity, unmeasurable checks, missing acceptance criteria, any `dependsOn` that points at a missing id, and any **environment-dependent check that does not carry `nondeterministic: true`** (treated as a blocking gap, because the loop would otherwise mistake an environmental miss for a code failure). The contract *is* the product, and the scariest failure mode is converging flawlessly on the wrong target, so the contract gets reviewed before a single line is built. **Blocking gaps halt the run for human input** (`contract-incomplete`) rather than letting Goalkeeper build confidently toward something underspecified, unless you pass `approvals: ["contract-gaps"]`.
 
 ### Loop (each round; advances at most one item)
 
@@ -102,7 +140,7 @@ If you pass `{ goal }` with no `items[]`, a **PLANNER** agent decomposes the goa
 
 4. **Living re-plan (only if the builder asks).** If the builder discovers the **contract itself** is wrong (the item needs an unlisted prerequisite, or should be split), it returns a `replanRequest` and the loop revises the working contract (adding and/or splitting items), persists it, and re-evaluates. This is capped by `maxReplans` (default 2); exceeding it escalates (`replan-budget`). It is for plan-is-wrong situations only, not for dodging a hard item.
 
-5. **Verify (authoritative).** An independent verifier — which does **not** trust the builder's report — runs the item's check *and* the full suite, plus a regression re-run of every already-passing item. It reports: regressions, any tampering with protected check files, the resulting git HEAD sha, a tree-id artifact hash, and whether the working tree is clean (a pass with uncommitted source changes is *not* a durable pass). This verifier, not the builder, decides whether the item passed.
+5. **Verify (authoritative).** An independent verifier — which does **not** trust the builder's report — runs the item's check *and* the full suite, plus a regression re-run of every already-passing item. It reports: regressions, any tampering with protected check files, the resulting git HEAD sha, a tree-id artifact hash, and whether the working tree is clean (a pass with uncommitted source changes is *not* a durable pass). This verifier, not the builder, decides whether the item passed. For a `nondeterministic` check it applies the item's `passPolicy` (retry up to `n`, running any `precondition` first, pass on latch or k-of-n) and **latches the tree-hash** on success; a `pipeline` check runs build-then-deploy-then-verify with the build-fail short-circuit; checks declaring a `shell`/`cwd`/`env` run through exactly that shell and environment.
 
 6. **Bookkeep.** A bookkeeper agent persists the updated **runtime** `plan.json` and appends to `worklog.md`, and **reverts the round** to `prevGoodHead` if the verifier flagged a regression or tamper (or any non-passing outcome).
 
@@ -115,13 +153,15 @@ When every item passes, an independent **final** full-suite check runs (`final-s
 - If the critic is satisfied, the run **converges** — but a converged result can still carry a `weaknesses[]` array and a `selfCritiqueSummary` of **minor** limitations it flagged but did not block on. So a "converged" result may ship with explicitly-flagged limitations; read them.
 - If the critique budget is already spent, the run converges without another pass.
 
+The **engine**, not the final-verify agent, is the authority that stamps `status: "converged"` (a focused, retried step decoupled from the cosmetic `REPORT.md`), so a nondeterministic latch-converge and a self-critique re-open can never leave a wrong or premature converged status. The converged result object gains a `statusStamped` boolean recording that the stamp was applied.
+
 ## Stop conditions (deterministic, with rationale)
 
 Each of these is evaluated in code at the end of a round. Each cites the prior art it is modeled on.
 
-- **Converged.** Every item passes, an independent *final* full-suite check is green, **and** the adversarial self-critique gate found no *blocking* weakness. Done is always an external check passing, never the builder's self-report. A converged result may still include `weaknesses[]` + `selfCritiqueSummary` listing minor limitations the critic flagged but did not block on, so "converged" can ship with documented caveats. (Modeled on Aider's zero-exit gate, SWE-agent's explicit `submit`, and Anthropic's evaluator-optimizer pattern, where a separate evaluator signs off on the work.)
+- **Converged.** Every item passes, an independent *final* full-suite check is green, **and** the adversarial self-critique gate found no *blocking* weakness. Done is always an external check passing, never the builder's self-report. The engine (not the final-verify agent) stamps the converged status, and a `nondeterministic` check that already latched a pass at the current tree-hash is honored at the final suite, so a single flaky miss there cannot un-converge a run that genuinely passed. A converged result may still include `weaknesses[]` + `selfCritiqueSummary` listing minor limitations the critic flagged but did not block on, so "converged" can ship with documented caveats. (Modeled on Aider's zero-exit gate, SWE-agent's explicit `submit`, and Anthropic's evaluator-optimizer pattern, where a separate evaluator signs off on the work.)
 
-- **Item-stuck.** The same item fails its check **3 times** → stop and escalate *that specific item* (the rest of the contract may already be green). (Modeled on Aider's `max_reflections = 3`.)
+- **Item-stuck.** The same item fails its check **3 times** → stop and escalate *that specific item* (the rest of the contract may already be green). A flaky miss of a `nondeterministic` check at a tree-hash that has already latched a pass does *not* count toward this counter, so an environmental miss cannot escalate code that already proved correct; a genuinely-wrong item that never latches still trips item-stuck normally. (Modeled on Aider's `max_reflections = 3`.)
 
 - **No-progress.** For **3 consecutive rounds** (default `maxStalls`), no item newly passes **and** git HEAD does not advance → halt. For a single stuck item the per-item **item-stuck** guard (3 attempts) usually fires first and names the blocking item; no-progress is the loop-wide backstop for churn across several items. The fingerprint recorded each round is `{tree-id, passing-count, head}`. (Modeled on OpenHands-style stuck detection.)
 
@@ -159,6 +199,8 @@ Any non-converged stop writes **`ESCALATION.md`** to `<repo>/.goalkeeper/` and t
 - **`self-critique-unactionable`** — the critic is unsatisfied but produced no actionable remediation item.
 - **`planning-failed`** — the planner could not produce a usable contract from the goal.
 - **`contract-lost`** — a started run found no `contract.json`; re-invoke with `amendContract` or reset.
+- **`contract-mismatch`**: an in-progress (or halted) run exists but this invocation passed a *different* contract (different goal or different item ids). The run halts and asks you to choose rather than silently resuming the wrong work.
+- **`contractPath-unreadable`**: `contractPath` was set but the file could not be read as JSON. The run fails fast instead of silently falling back to another contract source.
 - **`persist-failed`** — the working contract could not be written to disk (a fatal durability failure).
 
 `ESCALATION.md` contains: the goal restated; progress so far; the specific blocking item; the actual failing check output; what was already tried; the decision needed; **five one-tap options** (skip / relax / hint / **revise the contract** / abort); and exact resume instructions.
@@ -181,7 +223,15 @@ Convergence has its own on-disk artifact, the success analog of `ESCALATION.md`.
 
 **`freshStart`.** Pass `freshStart: true` to explicitly ignore and archive any existing goalkeeper state and start fresh. Use it to abandon an **unfinished** (halted or in-progress) run and start a different task on the same repo. A converged run auto-archives when you hand it new work; `freshStart` forces a clean start for **any** state.
 
-**The resume invariant is unchanged.** A **halted** or **in-progress** run still **auto-resumes** on the next invocation. That is the intended resume behavior, and it is untouched. Only a **converged** prior run (given new work), or `freshStart`, triggers the archive-and-start-fresh path.
+**Resume is gated on contract identity.** A **halted** or **in-progress** run **auto-resumes** on the next invocation *only when the incoming invocation is the same task*. Contract identity is the normalized goal plus the **sorted set of item ids** (ids, not descriptions, so wording tweaks do not count as a new contract). If you point Goalkeeper at a repo whose persisted run is in-progress (or halted) but pass a **different** contract (a different goal, or different item ids, supplied inline, via `contractPath`, or as a new goal), it does *not* silently resume the wrong work: it **halts with `contract-mismatch`** and asks you to choose. Your options:
+
+- **Continue** the existing run: re-invoke with **no contract** (or the same one).
+- **Replace** the contract in place: pass `amendContract: true`.
+- **Abandon** the old run and start the new task: pass `freshStart: true` (archives the old run), or delete the state dir.
+
+This extends the existing close-out behavior — which already archived a **converged** prior run on new work — to **halted** ones, so neither a finished nor an unfinished prior run can be silently overwritten by a different task.
+
+**`contractPath` fails fast.** If `contractPath` is set but the file cannot be read as JSON, the run now fails with `contractPath-unreadable` instead of silently falling back to inline `contract.items` or the planner. A contract you pointed at but Goalkeeper could not load is an error, not a reason to guess.
 
 > Caveat: re-passing the **same** contract after convergence is treated as new work, so it triggers a fresh rebuild. That is cheap (a re-verify, since the code is already committed) but it is not a no-op. To just check status without rebuilding, re-invoke with no contract, which returns `already-converged`.
 

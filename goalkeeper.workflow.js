@@ -36,6 +36,17 @@
  *      but dependency-ordered.
  *   2. No per-round git worktree yet: snapshot-HEAD + reset-on-fail on the live repo.
  *   3. Wall-clock cap is soft; hard backstops are maxIterations + token budget.
+ *
+ * HARDWARE-IN-THE-LOOP HARDENING (slow / non-deterministic checks)
+ *   - NON-DETERMINISTIC checks: a check may declare {nondeterministic:true, passPolicy:{mode:"latch"|"k-of-n",k,n}}.
+ *     A PASS proves the code is correct at that tree state; a later MISS at the SAME tree is only the environment not
+ *     cooperating. The engine LATCHES the tree-hash where such a check passed and does not let a flaky miss un-converge
+ *     or revert; the verifier also retries these checks up to n times. A genuinely-wrong (never-passing) item still halts.
+ *   - SHELL/ENV: a check may pin shell ("pwsh"|"bash"|"cmd"|"sh") + cwd + env so it runs in the right environment
+ *     (e.g. a Windows build that must run under PowerShell, never MSYS/git-bash).
+ *   - PIPELINE checks: {type:"pipeline", build, deploy, verify, freshBuild?} short-circuit to FAIL on a build error
+ *     BEFORE deploy, so a stale/failed artifact can never masquerade as a passing or regressing deploy.
+ *   - RESUME identity: a halted run only auto-resumes for the SAME contract; a different contract halts asking the human.
  */
 
 export const meta = {
@@ -130,6 +141,7 @@ const STATE_INIT = {
     replanCount: { type: 'number' },
     critiqueRounds: { type: 'number' },
     status: { type: 'string' },
+    latched: { type: 'object' },
     fileContract: { type: 'object', properties: { goal: { type: 'string' }, items: { type: 'array', items: ITEM_SHAPE } } },
     workingTreeDirty: { type: 'boolean' },
     notes: { type: 'string' },
@@ -302,9 +314,41 @@ function applyReplan (items, req) {
   return out
 }
 
+// --- non-deterministic check helpers ---
+// A check may declare {nondeterministic:true, passPolicy:{mode:"latch"|"k-of-n",k,n}}. For such checks a PASS proves the
+// code is correct at that tree state; a later MISS at the SAME tree proves only that the environment did not cooperate.
+function isNondet (it) { return !!(it && it.check && it.check.nondeterministic === true) }
+function passMode (it) { return (it && it.check && it.check.passPolicy && it.check.passPolicy.mode) || 'latch' }
+
+// --- contract identity (for the resume gate) ---
+// Stable identity = normalized goal + sorted item ids. ids (not descriptions) so wording tweaks are not a "new contract".
+function normGoal (g) { return String(g || '').trim().replace(/\s+/g, ' ').toLowerCase() }
+function contractIdentity (goal, items) {
+  const ids = (items || []).map(function (it) { return it && it.id }).filter(Boolean).sort()
+  return normGoal(goal) + '|' + ids.join(',')
+}
+
 // ----------------------------------------------------------------------------
 // Prompt builders
 // ----------------------------------------------------------------------------
+// Shared check-execution semantics, injected into every prompt that RUNS a contract check (builder, verifier, final).
+const CHECK_SEMANTICS_NOTE = [
+  'CHECK EXECUTION SEMANTICS (honor these for EVERY check object you run):',
+  '- shell/cwd/env: if a check declares shell ("pwsh"|"bash"|"cmd"|"sh"), cwd, or env, run its command through THAT',
+  '  exact shell, in THAT cwd (default: the repo root), with THOSE env vars set -- never your own default shell. On',
+  '  Windows shell:"pwsh" = PowerShell (e.g. pwsh -NoProfile -Command "..." or pwsh -NoProfile -File x.ps1), NEVER',
+  '  git-bash/MSYS; shell:"cmd" = cmd.exe. Running a check in the wrong shell is a SETUP error, not a real failure.',
+  '- nondeterministic: a check may declare nondeterministic:true with passPolicy:{mode:"latch"|"k-of-n",k,n}. The',
+  '  ENVIRONMENT (not the code) can make it miss. Run it up to n attempts (default n=3); if it declares a precondition',
+  '  command, run that first on each attempt to set up the environment. It PASSES if it succeeds at least once (mode',
+  '  "latch", the default) or at least k of n times (mode "k-of-n"); report it FAILING only after all n attempts miss.',
+  '- pipeline: a check may be {type:"pipeline", build, deploy, verify, freshBuild?}. Run BUILD first; if build exits',
+  '  non-zero the check FAILS immediately -- do NOT run deploy or verify (never deploy a failed build). To avoid',
+  '  deploying a STALE artifact from an incremental build that did not pick up new sources, do a clean/reconfigured build',
+  '  when freshBuild:true is set OR whenever you cannot otherwise confirm the artifact was rebuilt from current source.',
+  '  Only a clean build proceeds to deploy then verify; the check passes only if verify passes.',
+].join('\n')
+
 function plannerPrompt (goalText) {
   return [
     'You are the PLANNER. Decompose this goal into a done-contract for an autonomous ' + mode + ' loop in repo ' + repo + '.',
@@ -318,6 +362,12 @@ function plannerPrompt (goalText) {
     'RULES: checks resolve against the repo root "' + repo + '"; each check must exercise REAL behavior including',
     'error/failure paths, not just the happy path; no check that is trivially gameable or only asserts existence when',
     'behavior is what matters. Prefer test-first where it applies. Keep items small enough to build in one round.',
+    'CHECK CAPABILITIES (use when they fit): a check may pin its shell with shell:"pwsh"|"bash"|"cmd"|"sh" (+ optional',
+    'cwd, env) so it runs in the right environment; declare nondeterministic:true with passPolicy:{mode:"latch"|"k-of-n",',
+    'k,n} (+ optional precondition command) when a pass depends on an external event/timing rather than the code; or be',
+    '{type:"pipeline", build, deploy, verify, freshBuild?} for build-and-deploy work so a build failure short-circuits',
+    'BEFORE deploy (never deploy a stale/failed artifact). Declare nondeterministic for ANY check whose result can vary',
+    'with the environment, so an environmental miss is not mistaken for a code failure.',
     'Return PLAN_RESULT { items }.',
   ].join('\n')
 }
@@ -334,6 +384,11 @@ function specReviewPrompt (goalText, items) {
     'For each item ask: is the check concrete and machine-checkable? could an agent satisfy the LETTER of the check while',
     'missing the intent? does the check exercise ERROR/failure paths or only the happy path? is anything ambiguous,',
     'unverifiable, or does any dependsOn reference a missing id?',
+    'NON-DETERMINISM: if a check\'s pass can depend on an external event or timing (not just the code), it MUST declare',
+    'nondeterministic:true with a passPolicy; an environment-dependent check WITHOUT that declaration IS a blocking gap,',
+    'because the loop would treat an environmental miss as a real code failure. BUILD/DEPLOY: a check that builds then',
+    'deploys/measures should short-circuit on build failure (a {type:"pipeline"} check does); flag any deploy/measure',
+    'check that could act on a stale artifact after a failed or no-op build.',
     'Return CONTRACT_REVIEW. approved=true ONLY if there are zero blocking gaps. List every blocking gap.',
     'This is review only -- do NOT modify any files.',
   ].join('\n')
@@ -348,9 +403,10 @@ function initPrompt () {
     '   ".goalkeeper/" to ' + repo + '/.git/info/exclude if not already present (create that file if needed).',
     '3. RUNTIME state -- if ' + statePath + '/plan.json exists, read it and return: passing[] item ids, prevGoodHead,',
     '   iteration as startIteration, attempts{} (per-item failed-attempt counts), fpHistory[] ({hash,pass,head} per round),',
-    '   and status (the plan.json "status" field, usually "in-progress" or "converged").',
-    '   If it does not exist, seed: passing=[], startIteration=0, attempts={}, fpHistory=[], status="fresh", and set',
-    '   prevGoodHead to the current git HEAD sha (git -C "' + repo + '" rev-parse HEAD).',
+    '   latched{} (per-nondeterministic-item: the git tree-hash at which its check last passed), and status (the plan.json',
+    '   "status" field, usually "in-progress" or "converged").',
+    '   If it does not exist, seed: passing=[], startIteration=0, attempts={}, fpHistory=[], latched={}, status="fresh", and',
+    '   set prevGoodHead to the current git HEAD sha (git -C "' + repo + '" rev-parse HEAD).',
     '4. WORKING CONTRACT -- if ' + statePath + '/contract.json exists, read it and return its items[], goal, replanCount,',
     '   critiqueRounds. If it does not exist, return items=[], goal="", replanCount=0, critiqueRounds=0.',
     '   All of these MUST round-trip so the anti-spin guards, the mutable contract, and the re-plan/critique caps survive resume.',
@@ -388,7 +444,8 @@ function builderPrompt (item, goalText) {
     '  - NO placeholder, stub, mock-of-the-thing-under-test, or TODO implementations. Full real implementation only.',
     '  - FORBIDDEN actions, never perform: ' + j(denylist) + '.',
     'PRIOR ATTEMPTS on this item and why they failed are in ' + statePath + '/worklog.md -- read it first; do NOT repeat a failed approach.',
-    'WHEN DONE: run the item check yourself, then commit ONLY your changes with message "goalkeeper: ' + item.id + '".',
+    CHECK_SEMANTICS_NOTE,
+    'WHEN DONE: run the item check yourself (honoring the semantics above), then commit ONLY your changes with message "goalkeeper: ' + item.id + '".',
     'Return BUILD_RESULT with the new git HEAD sha, whether you touched any checkPaths, and selfReportedPass.',
     'If you cannot proceed, set blocked=true with a clear blockerReason instead of faking progress.',
     'LIVING RE-PLAN: ONLY if you discover the CONTRACT itself is wrong (this item needs an unlisted prerequisite, or',
@@ -402,9 +459,12 @@ function verifierPrompt (item, prevGoodHead, passingIds, items) {
   return [
     'You are the INDEPENDENT VERIFIER. Do NOT trust the builder. In repo ' + repo + ':',
     'All checks resolve against the repo root: run commands with "' + repo + '" as the working directory; file_exists/grep paths are relative to "' + repo + '".',
+    CHECK_SEMANTICS_NOTE,
     '1. Run THIS item check and set itemPassed: ' + j(item.check),
     '2. REGRESSION check: these items were already passing: ' + j(passingIds) + '. Re-run THEIR checks at the current',
-    '   HEAD and list by id any that now FAIL (those are regressions). If that list is empty, regressions=[].',
+    '   HEAD and list by id any that now FAIL (those are regressions). If that list is empty, regressions=[]. When a',
+    '   re-checked item is nondeterministic, apply its retry/passPolicy (above) so a flaky environmental miss is NOT',
+    '   reported as a regression.',
     '3. fullSuitePassed: true ONLY if EVERY current contract item check passes right now. Items: ' +
       j(items.map(function (i) { return { id: i.id, check: i.check } })) + '. Informational per-round; authoritative only at convergence.',
     '4. Tamper check: git -C "' + repo + '" diff --name-only ' + prevGoodHead + ' HEAD' +
@@ -424,9 +484,13 @@ function finalVerifyPrompt (items) {
   return [
     'FINAL verification before declaring the contract done, in repo ' + repo + '.',
     'All checks resolve against the repo root: run commands with "' + repo + '" as the working directory; file_exists/grep paths are relative to "' + repo + '".',
+    CHECK_SEMANTICS_NOTE,
     'Run the FULL check suite for every contract item: ' + j(items.map(function (i) { return { id: i.id, check: i.check } })),
-    'Set fullSuitePassed=true ONLY if every item check passes with zero regressions. List any failures as regressions.',
-    'If (and ONLY if) every item check passes, stamp ' + statePath + '/plan.json status to "converged" (read-merge-write).',
+    'Set fullSuitePassed=true ONLY if every item check passes. In regressions[], list the ID of every item whose check',
+    'FAILS (use the item id, not prose); empty if all pass. For a nondeterministic check, apply its retry/passPolicy',
+    '(above) before deciding it failed -- a flaky environmental miss is not a failure.',
+    'Do NOT stamp any status yourself: the ENGINE decides convergence (self-critique may still re-open the loop, and a',
+    'nondeterministic item can latch-converge without a green suite). Just report the suite result.',
     'Return headSha (rev-parse HEAD) and artifactHash (rev-parse HEAD^{tree}). Do not modify SOURCE files.',
   ].join('\n')
 }
@@ -476,7 +540,8 @@ function bookkeeperPrompt (data) {
     '   (Anti-destruction reset: ANY non-passing round rolls back to last-good so the tree never ratchets backward.)',
     '2. Read ' + statePath + '/plan.json if present, then write it (RUNTIME state only) merged with: passing=' + j(data.passing) +
       ', attempts=' + j(data.attempts) + ', iteration=' + data.iteration + ', prevGoodHead=' + j(data.prevGoodHead) +
-      ', and APPEND this fingerprint (shape {hash,pass,head}) to fpHistory: ' + j(data.fingerprint) + '. Keep status="in-progress".',
+      ', latched=' + j(data.latched) + ' (per-nondeterministic-item tree-hash where its check last passed),' +
+      ' and APPEND this fingerprint (shape {hash,pass,head}) to fpHistory: ' + j(data.fingerprint) + '. Keep status="in-progress".',
     '   (The working contract lives in the SEPARATE contract.json -- do NOT read or write it here.)',
     '3. APPEND one entry to ' + statePath + '/worklog.md:  round ' + data.iteration + ', item ' + data.item.id +
       ', outcome ' + data.outcome + ', reflection: ' + (data.reflection || '') + '  (be specific about WHY).',
@@ -534,6 +599,15 @@ function closeOutPrompt (data) {
   ].join('\n')
 }
 
+function markConvergedPrompt () {
+  return [
+    'Stamp the goalkeeper run as CONVERGED in repo ' + repo + ' (state dir ' + statePath + ').',
+    'Read ' + statePath + '/plan.json, set its "status" field to "converged", and write it back (read-merge-write; keep',
+    'every other field). This durable stamp is what tells a later invocation the run finished, so it does NOT re-run the',
+    'whole (possibly slow) check suite. Do NOT touch git or source files. Return PERSIST_RESULT { persisted: true } only on success.',
+  ].join('\n')
+}
+
 function archiveStalePrompt (reason) {
   return [
     'Archive a finished/abandoned goalkeeper run so the NEW run starts clean, in repo ' + repo + ' (state dir ' + statePath + ').',
@@ -585,6 +659,21 @@ async function closeOut (data) {
   } catch (e) { return { reportWritten: false, note: 'close-out failed (non-fatal): ' + String(e) } }
 }
 
+// Stamp durable status="converged". The ENGINE is the authority on convergence (the final-verify agent cannot know
+// self-critique may re-open the loop, and a latch-converge happens without the agent seeing a green suite). Kept SEPARATE
+// from the cosmetic REPORT.md so a report failure can never leave the run un-stamped (which would make the next run
+// re-verify the whole suite). Bounded retry; non-fatal -- the work IS converged either way, this only affects re-verify cost.
+async function markConverged () {
+  for (var a = 0; a < 2; a++) {
+    try {
+      const r = await agent(markConvergedPrompt(), { label: 'mark-converged', phase: 'Review', effort: 'low', schema: PERSIST_RESULT })
+      if (r && r.persisted) return { ok: true }
+    } catch (e) { /* retry once */ }
+  }
+  log('WARNING: could not stamp status=converged; the next invocation may re-run the final suite before recognizing completion.')
+  return { ok: false }
+}
+
 // Seal a finished/abandoned run by moving its state into .goalkeeper/archive so the next run starts clean. Best-effort:
 // even if the move fails, the caller wipes the in-memory resume fields, so the new run still starts fresh.
 async function archiveStale (reason) {
@@ -616,6 +705,15 @@ if (!init.initialized) {
   return await escalate('init-failed', { init: init })
 }
 
+// If the caller asked for a FILE contract but it could not be read, fail clearly here rather than silently falling back
+// to an inline/planner contract (or later mis-reporting it as a contract mismatch).
+if (cfg.contractPath && !init.fileContract) {
+  return {
+    status: 'error', reason: 'contractPath-unreadable',
+    note: 'contractPath was set to "' + cfg.contractPath + '" but it could not be read as JSON {goal,items}. Fix the path or the JSON, or pass the contract inline.' + (init.notes ? (' init note: ' + init.notes) : ''),
+  }
+}
+
 // CLOSE-OUT AWARE RESUME. A previous run that CONVERGED, or an explicit cfg.freshStart, must NOT be auto-resumed as if
 // still in progress -- otherwise re-running goalkeeper on the same repo for a NEW task just re-examines the finished
 // contract and "converges" again. A HALTED/in-progress run still auto-resumes by design (use freshStart to abandon it).
@@ -634,6 +732,32 @@ if ((cfg.freshStart === true || priorStatus === 'converged') && hasPriorState) {
   init.startIteration = 0; init.replanCount = 0; init.critiqueRounds = 0
 }
 
+// CONTRACT-IDENTITY RESUME GATE. A HALTED/in-progress run auto-resumes ONLY when the incoming invocation is the SAME
+// task. If a DIFFERENT contract is passed (different goal, or different item ids), silently resuming the stale contract
+// would re-escalate the wrong work (an observed footgun). Halt and make the human choose -- safer than discarding a
+// halted run that may have an ESCALATION.md a human is mid-acting-on. freshStart abandons it; amendContract replaces it.
+// Only gate when there is an actual persisted CONTRACT to compare; a started-but-contract-lost run falls through to its
+// dedicated contract-lost escalation below.
+const hasPersistedContract = !!(init.items && init.items.length)
+if (hasPersistedContract && hasNewWork && !cfg.freshStart && !cfg.amendContract) {
+  const incFile = init.fileContract || null
+  const incItems = (incFile && incFile.items && incFile.items.length) ? incFile.items
+    : (contract.items && contract.items.length) ? contract.items : null
+  const incGoal = (incFile && incFile.goal) || contract.goal || ''
+  const persistedCmp = incItems ? contractIdentity(init.goal, init.items) : contractIdentity(init.goal, [])
+  const incomingCmp = incItems ? contractIdentity(incGoal || init.goal, incItems) : contractIdentity(incGoal, [])
+  if (incomingCmp !== persistedCmp) {
+    return {
+      status: 'halted', reason: 'contract-mismatch', passing: init.passing || [], persistedGoal: init.goal || '',
+      note: 'The persisted in-progress contract on this repo differs from the contract you passed, so goalkeeper did NOT ' +
+        'silently resume the old one. To CONTINUE the existing run, re-invoke with no contract (or the same goal/items). ' +
+        'To REPLACE it with the new contract, pass amendContract:true. To ABANDON it and start the new task fresh, pass ' +
+        'freshStart:true (archives the old run). Or delete ' + statePath + ' to wipe. See ' + statePath + '/ESCALATION.md ' +
+        'for the halted run\'s state.',
+    }
+  }
+}
+
 var prevGoodHead = init.prevGoodHead
 passingSet = new Set(init.passing || [])
 passingCount = passingSet.size
@@ -641,6 +765,7 @@ const retries = Object.assign({}, init.attempts || {})
 const humanAmended = (cfg.resetAttempts || []).length > 0
 ;(cfg.resetAttempts || []).forEach(function (id) { delete retries[id] })
 const fpHistory = (init.fpHistory || []).slice()
+var latched = Object.assign({}, init.latched || {}) // per-nondeterministic-item: tree-hash where its check last passed
 var stallCount = humanAmended ? 0 : computeStall(fpHistory)
 var iteration = init.startIteration || 0
 var replanCount = init.replanCount || 0
@@ -716,13 +841,25 @@ var lastScopeCheck = -1
 
 while (true) {
   const pending = workingItems.filter(function (it) { return !passingSet.has(it.id) })
+  const byId = {}; workingItems.forEach(function (it) { byId[it.id] = it })
 
   // ---- all items passing -> SELF-CRITIQUE gate, then converge ----
   if (pending.length === 0) {
     const finalV = await agent(finalVerifyPrompt(workingItems), { label: 'final-verify', phase: 'Loop', effort: 'high', schema: VERIFY_RESULT })
-    if (!(finalV.fullSuitePassed && (!finalV.regressions || finalV.regressions.length === 0))) {
-      return await escalate('final-suite-failed', { finalV: finalV })
+    // LATCH: a nondeterministic+latch item that already passed at the CURRENT final tree is latched-green; a flaky
+    // environmental miss on the re-run does NOT un-converge the run. A failure is "real" only for a non-excused item.
+    const finalFailing = finalV.regressions || []
+    const realFinalFail = finalFailing.filter(function (id) {
+      const it = byId[id]; if (!it) return true
+      // any nondeterministic item (latch OR k-of-n) that already met its check at the final tree: a flaky miss is excused.
+      if (isNondet(it) && latched[id] && latched[id] === finalV.artifactHash) return false
+      return true
+    })
+    const suiteOk = (finalV.fullSuitePassed && finalFailing.length === 0) || (finalFailing.length > 0 && realFinalFail.length === 0)
+    if (!suiteOk) {
+      return await escalate('final-suite-failed', { finalV: finalV, realFailures: realFinalFail })
     }
+    if (finalFailing.length > 0) log('final suite: ' + finalFailing.length + ' nondeterministic item(s) latched-green despite a flaky miss')
 
     if (critiqueRounds < caps.maxCritiqueRounds) {
       phase('Review')
@@ -745,20 +882,22 @@ while (true) {
       if (!crit.satisfied) {
         return await escalate('self-critique-unactionable', { weaknesses: crit.weaknesses || [], summary: crit.summary || '' })
       }
-      // satisfied (no blocking weaknesses) -> converge: write the completion report, then return (fable step 4)
+      // satisfied (no blocking weaknesses) -> converge: stamp status (authoritative), write the report, then return (fable step 4)
+      const conv1 = await markConverged()
       const report1 = await closeOut({ head: finalV.headSha, iterations: iteration, weaknesses: crit.weaknesses || [] })
       return {
         status: 'converged', passing: Array.from(passingSet), head: finalV.headSha, iterations: iteration,
-        weaknesses: crit.weaknesses || [], selfCritiqueSummary: crit.summary || '', report: report1,
+        weaknesses: crit.weaknesses || [], selfCritiqueSummary: crit.summary || '', report: report1, statusStamped: conv1.ok,
         summary: 'All ' + workingItems.length + ' contract items pass, the full suite is green, and self-critique found no blocking weaknesses. Completion report written to ' + statePath + '/REPORT.md.',
       }
     }
 
-    // critique budget spent -> converge: write the completion report, then return (do not loop forever on critique)
+    // critique budget spent -> converge: stamp status (authoritative), write the report, then return (do not loop forever)
+    const conv2 = await markConverged()
     const report2 = await closeOut({ head: finalV.headSha, iterations: iteration, weaknesses: [] })
     return {
       status: 'converged', passing: Array.from(passingSet), head: finalV.headSha, iterations: iteration,
-      note: 'self-critique budget (maxCritiqueRounds=' + caps.maxCritiqueRounds + ') reached.', report: report2,
+      note: 'self-critique budget (maxCritiqueRounds=' + caps.maxCritiqueRounds + ') reached.', report: report2, statusStamped: conv2.ok,
       summary: 'All ' + workingItems.length + ' contract items pass and the full suite is green. Completion report written to ' + statePath + '/REPORT.md.',
     }
   }
@@ -827,12 +966,25 @@ while (true) {
   } else {
     const v = await agent(verifierPrompt(item, prevGoodHead, Array.from(passingSet), workingItems), { label: 'verify:' + item.id + '#' + iteration, phase: 'Loop', effort: 'high', schema: VERIFY_RESULT })
     hash = v.artifactHash
+    const curTree = v.artifactHash
+    // LATCH (nondeterministic, latch mode): a miss on an item that already passed at THIS exact tree is environmental.
+    // (For the focal item this mainly guards resume/partial-state edges, since a passed item is normally not re-selected.)
+    const focalLatchHit = isNondet(item) && passMode(item) === 'latch' && latched[item.id] && latched[item.id] === curTree
+    // Regressions: drop any nondeterministic item (latch OR k-of-n) that already met its check at THIS exact tree -- a
+    // later miss at the same code state is environmental, not a real regression.
+    const realRegr = (v.regressions || []).filter(function (id) {
+      const it = byId[id]; if (!it) return true
+      if (isNondet(it) && latched[id] && latched[id] === curTree) return false
+      return true
+    })
     if (v.checksTampered && !item.allowTestEdit) {
       outcome = 'revert-tamper'; reflection = 'builder modified write-protected check files'
-    } else if (v.regressions && v.regressions.length > 0) {
-      outcome = 'revert-regression'; reflection = 'regressed: ' + v.regressions.join('; ')
-    } else if (v.itemPassed && (v.workingTreeClean !== false)) {
-      outcome = 'passed'; head = v.headSha; reflection = v.summary || 'item check green; no regressions'
+    } else if (realRegr.length > 0) {
+      outcome = 'revert-regression'; reflection = 'regressed: ' + realRegr.join('; ')
+    } else if ((v.itemPassed || focalLatchHit) && (v.workingTreeClean !== false)) {
+      outcome = 'passed'; head = v.headSha
+      reflection = (focalLatchHit && !v.itemPassed) ? 'nondeterministic check latched-green at this tree (environmental miss excused)' : (v.summary || 'item check green; no regressions')
+      if (isNondet(item)) latched[item.id] = curTree // record/refresh the tree where this nondeterministic check passed
     } else if (v.itemPassed && v.workingTreeClean === false) {
       outcome = 'failed'; reflection = 'item check passed but the working tree has uncommitted source changes; not a durable pass'
     } else {
@@ -852,7 +1004,7 @@ while (true) {
 
   const bk = await agent(bookkeeperPrompt({
     item: { id: item.id }, outcome: outcome, doRevert: doReset, revertTo: prevGoodHead,
-    passing: Array.from(passingSet), attempts: retries, iteration: iteration,
+    passing: Array.from(passingSet), attempts: retries, iteration: iteration, latched: latched,
     prevGoodHead: prevGoodHead, fingerprint: { hash: hash, pass: passingCount, head: effHead }, reflection: reflection,
   }), { label: 'book:' + item.id + '#' + iteration, phase: 'Loop', effort: 'low', schema: BOOKKEEP_RESULT })
 
