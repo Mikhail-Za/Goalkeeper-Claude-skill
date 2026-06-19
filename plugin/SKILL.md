@@ -62,7 +62,8 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
 
   // ---- resume / amend (used when re-invoking after an escalation) ----
   amendContract: false,          // true: OVERRIDE the persisted contract.json with this call's contract.items[] (otherwise the persisted contract wins on resume)
-  resetAttempts: []              // e.g. ["over-limit-returns-429"]: clear that item's retry count + stall on a human-amended resume so a relaxed check gets a fresh budget
+  resetAttempts: [],             // e.g. ["over-limit-returns-429"]: clear that item's retry count + stall on a human-amended resume so a relaxed check gets a fresh budget
+  freshStart: false              // true: archive ANY existing goalkeeper state (incl. an unfinished run) and start the new task on a clean slate. A converged run auto-archives on new work without this.
 }})
 ```
 
@@ -170,6 +171,20 @@ Any non-converged stop writes **`ESCALATION.md`** to `<repo>/.goalkeeper/` and t
 
 Because all state is on disk, resuming is just running the skill again against the same repo.
 
+## Close-out on success
+
+Convergence has its own on-disk artifact, the success analog of `ESCALATION.md`. When a run converges, Goalkeeper writes **`REPORT.md`** to `<repo>/.goalkeeper/` containing: the goal; the outcome (converged); the contract items and their checks (all passing); the final git HEAD; the commits Goalkeeper made; the iteration count; a short summary of what was built; and any minor, non-blocking weaknesses the self-critique flagged. The converged result object also carries a `report: { reportWritten, path }` field pointing at it. A converged run therefore self-documents: you do not have to reconstruct what happened from the worklog.
+
+**Switching tasks on the same repo just works.** A converged run leaves its state on disk, so the naive behavior would be for the next invocation to reload the finished contract and immediately "converge" again instead of doing the new task. Goalkeeper avoids that: on a new run, if the prior run had **converged** and you pass a **new** goal/contract, it **archives** the old run into `<repo>/.goalkeeper/archive/converged-<short-head>/` (its `plan.json`, `contract.json`, `worklog.md`, and `REPORT.md`) and starts the new task on a clean slate. The previous work in the repo is preserved (it was committed); only the goalkeeper *state* is archived.
+
+**Re-run with nothing new** on a converged repo returns `status: "already-converged"` (pointing at `REPORT.md`) instead of redoing the work. To just check the status of a finished run, re-invoke with no contract.
+
+**`freshStart`.** Pass `freshStart: true` to explicitly ignore and archive any existing goalkeeper state and start fresh. Use it to abandon an **unfinished** (halted or in-progress) run and start a different task on the same repo. A converged run auto-archives when you hand it new work; `freshStart` forces a clean start for **any** state.
+
+**The resume invariant is unchanged.** A **halted** or **in-progress** run still **auto-resumes** on the next invocation. That is the intended resume behavior, and it is untouched. Only a **converged** prior run (given new work), or `freshStart`, triggers the archive-and-start-fresh path.
+
+> Caveat: re-passing the **same** contract after convergence is treated as new work, so it triggers a fresh rebuild. That is cheap (a re-verify, since the code is already committed) but it is not a no-op. To just check status without rebuilding, re-invoke with no contract, which returns `already-converged`.
+
 ## Autonomy modes
 
 - **envelope (default).** Runs unattended. It halts only on the hard triggers above (a blocking spec gap, a stuck item, no-progress, oscillation, budget, a dependency deadlock, a scope-check recommending a stop, an unactionable self-critique, or a re-plan past budget). Re-planning and minor self-critique remediation happen *automatically* in this mode, within their caps. This is the "go do it, and bother me only if you're genuinely blocked" mode.
@@ -206,7 +221,7 @@ Three things are deferred, all sharing the same safety property (a bad round can
 
 **Denylist.** The forbidden actions — `git push`, `deploy`, `secrets`, `external-send` — are enforced in **both** autonomy modes, regardless of `mode` or `autonomy`. Goalkeeper operates inside the repo and does not reach outside it.
 
-**Kill switch.** To stop a run, **stop the Workflow** from `/workflows`. To reset Goalkeeper's state entirely, **delete the `.goalkeeper/` directory** (under `<repo>/`) — that clears *both* state files, `plan.json` (runtime) and `contract.json` (working contract), plus `worklog.md` and any `ESCALATION.md`. The next invocation then starts fresh from the contract you pass in (or re-plans from the goal).
+**Kill switch.** To stop a run, **stop the Workflow** from `/workflows`. To reset Goalkeeper's state entirely, **delete the `.goalkeeper/` directory** (under `<repo>/`). That clears *both* state files, `plan.json` (runtime) and `contract.json` (working contract), plus `worklog.md`, any `ESCALATION.md` or `REPORT.md`, and the `archive/` of past converged runs. The next invocation then starts fresh from the contract you pass in (or re-plans from the goal). You rarely need to do this by hand: a **converged** run self-documents via `REPORT.md` and auto-archives when you give it a new task, and `freshStart: true` archives any leftover state for you. Deleting the directory remains the blunt full reset.
 
 ## Example invocation
 

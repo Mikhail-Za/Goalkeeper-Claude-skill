@@ -109,7 +109,8 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
   contractPath: null,            // optional: absolute path to a JSON file { goal, items[] }. Read at init, bypassing the args channel. Use for LARGE explicit contracts (inline args can truncate).
   checkPaths: ["tests/**"],
   caps: { maxIterations: 20, maxTokens: 500000 },
-  denylist: ["git push","deploy","secrets","external-send"]
+  denylist: ["git push","deploy","secrets","external-send"],
+  freshStart: false              // optional: archive any existing goalkeeper state (even an unfinished run) and start this task on a clean slate
 }})
 ```
 
@@ -146,6 +147,10 @@ A run moves through five phases: **Plan → Setup → Loop → Review → Escala
 5. **Escalate**: any non-converged stop writes `ESCALATION.md` and pings Telegram if reachable.
 
 State lives in two files under `<repo>/.goalkeeper/`: `plan.json` (runtime: passing items, attempts, fingerprint history) and `contract.json` (the durable working contract). They are separated deliberately so the per-round bookkeeper can never clobber the contract. Both are git-excluded automatically.
+
+### Reusing a repo / switching tasks
+
+When a run converges it writes a completion report to `<repo>/.goalkeeper/REPORT.md` (the success analog of `ESCALATION.md`: the goal, the passing contract, the commits it made, the iteration count, a summary, and any minor caveats) and seals that run. So you can point Goalkeeper at a **new** task on the **same** repo and it starts fresh: the old converged run is archived under `.goalkeeper/archive/converged-<short-head>/` and the new task begins on a clean slate. Your committed work in the repo is untouched; only the goalkeeper state moves. Re-running with nothing new on a converged repo just returns `already-converged` (it does not redo the work). A halted or in-progress run still auto-resumes on the next invocation as before. To abandon an **unfinished** run and start a different task, pass `freshStart: true`, which archives whatever state is there and starts clean.
 
 `SKILL.md` documents every stop condition, guard, escalation reason, and argument in detail.
 

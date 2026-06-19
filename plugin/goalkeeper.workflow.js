@@ -129,6 +129,7 @@ const STATE_INIT = {
     goal: { type: 'string' },
     replanCount: { type: 'number' },
     critiqueRounds: { type: 'number' },
+    status: { type: 'string' },
     fileContract: { type: 'object', properties: { goal: { type: 'string' }, items: { type: 'array', items: ITEM_SHAPE } } },
     workingTreeDirty: { type: 'boolean' },
     notes: { type: 'string' },
@@ -216,6 +217,8 @@ const ESCALATION_RESULT = {
   properties: { written: { type: 'boolean' }, path: { type: 'string' }, telegramSent: { type: 'boolean' } },
   required: ['written'],
 }
+const CLOSEOUT_RESULT = { type: 'object', properties: { reportWritten: { type: 'boolean' }, path: { type: 'string' } }, required: ['reportWritten'] }
+const ARCHIVE_RESULT = { type: 'object', properties: { archived: { type: 'boolean' }, path: { type: 'string' } }, required: ['archived'] }
 
 // ----------------------------------------------------------------------------
 // Pure decision helpers (deterministic, no I/O)
@@ -344,9 +347,10 @@ function initPrompt () {
     '2. Ensure git IGNORES the state directory so it never pollutes "git status" or gets committed: append a line',
     '   ".goalkeeper/" to ' + repo + '/.git/info/exclude if not already present (create that file if needed).',
     '3. RUNTIME state -- if ' + statePath + '/plan.json exists, read it and return: passing[] item ids, prevGoodHead,',
-    '   iteration as startIteration, attempts{} (per-item failed-attempt counts), fpHistory[] ({hash,pass,head} per round).',
-    '   If it does not exist, seed: passing=[], startIteration=0, attempts={}, fpHistory=[], and set prevGoodHead to the',
-    '   current git HEAD sha (git -C "' + repo + '" rev-parse HEAD).',
+    '   iteration as startIteration, attempts{} (per-item failed-attempt counts), fpHistory[] ({hash,pass,head} per round),',
+    '   and status (the plan.json "status" field, usually "in-progress" or "converged").',
+    '   If it does not exist, seed: passing=[], startIteration=0, attempts={}, fpHistory=[], status="fresh", and set',
+    '   prevGoodHead to the current git HEAD sha (git -C "' + repo + '" rev-parse HEAD).',
     '4. WORKING CONTRACT -- if ' + statePath + '/contract.json exists, read it and return its items[], goal, replanCount,',
     '   critiqueRounds. If it does not exist, return items=[], goal="", replanCount=0, critiqueRounds=0.',
     '   All of these MUST round-trip so the anti-spin guards, the mutable contract, and the re-plan/critique caps survive resume.',
@@ -516,6 +520,34 @@ function escalationWritePrompt (payload) {
   ].join('\n')
 }
 
+function closeOutPrompt (data) {
+  return [
+    'The goalkeeper run CONVERGED (success). Write the completion report, in repo ' + repo + ' (state dir ' + statePath + ').',
+    'Run data: ' + j(data),
+    'Write ' + statePath + '/REPORT.md -- the success analog of ESCALATION.md. Read ' + statePath + '/contract.json for the',
+    'goal + items, and ' + statePath + '/worklog.md for the build narrative. Render clear sections: Goal; Outcome',
+    '(converged); each contract item id with its check (all passing); Final HEAD ' + data.head + '; the commits goalkeeper',
+    'made (run git -C "' + repo + '" log --oneline -' + ((data.iterations || 0) + 5) + ' and include the lines whose message',
+    'starts with "goalkeeper:"); Iterations (' + data.iterations + '); a short Summary of what was built (from the worklog);',
+    'and any minor non-blocking weaknesses the self-critique flagged (may be empty): ' + j(data.weaknesses || []) + '.',
+    'Do NOT touch git or source files. Return CLOSEOUT_RESULT { reportWritten: true, path: "' + statePath + '/REPORT.md" }.',
+  ].join('\n')
+}
+
+function archiveStalePrompt (reason) {
+  return [
+    'Archive a finished/abandoned goalkeeper run so the NEW run starts clean, in repo ' + repo + ' (state dir ' + statePath + ').',
+    'Reason: ' + reason + ' (the previous run converged, or an explicit freshStart).',
+    'Steps:',
+    '1. Compute a short id: git -C "' + repo + '" rev-parse --short HEAD .',
+    '2. Create directory ' + statePath + '/archive/' + reason + '-<short> .',
+    '3. MOVE (not copy) these files from ' + statePath + '/ into that archive dir IF they exist: plan.json, contract.json,',
+    '   worklog.md, REPORT.md, ESCALATION.md.',
+    '4. Afterward the active ' + statePath + '/ MUST contain NO plan.json and NO contract.json (only the archive/ subdir).',
+    'Do NOT touch git or source files. Return ARCHIVE_RESULT { archived: true, path: "<archive dir>" }.',
+  ].join('\n')
+}
+
 // ----------------------------------------------------------------------------
 // Mutable run state (declared before escalate() so payloads can read them)
 // ----------------------------------------------------------------------------
@@ -545,6 +577,23 @@ async function persistContract (counters) {
   } catch (e) { return { ok: false, error: String(e) } }
 }
 
+// On convergence: write the completion report (the success analog of ESCALATION.md). Best-effort.
+async function closeOut (data) {
+  try {
+    const r = await agent(closeOutPrompt(data), { label: 'close-out', phase: 'Review', effort: 'low', schema: CLOSEOUT_RESULT })
+    return r || { reportWritten: false }
+  } catch (e) { return { reportWritten: false, note: 'close-out failed (non-fatal): ' + String(e) } }
+}
+
+// Seal a finished/abandoned run by moving its state into .goalkeeper/archive so the next run starts clean. Best-effort:
+// even if the move fails, the caller wipes the in-memory resume fields, so the new run still starts fresh.
+async function archiveStale (reason) {
+  try {
+    const r = await agent(archiveStalePrompt(reason), { label: 'archive:' + reason, phase: 'Plan', effort: 'low', schema: ARCHIVE_RESULT })
+    return r || { archived: false }
+  } catch (e) { log('archiveStale failed (non-fatal): ' + String(e)); return { archived: false } }
+}
+
 // ----------------------------------------------------------------------------
 // Main
 // ----------------------------------------------------------------------------
@@ -566,6 +615,25 @@ const init = await agent(initPrompt(), { label: 'init-state', phase: 'Plan', eff
 if (!init.initialized) {
   return await escalate('init-failed', { init: init })
 }
+
+// CLOSE-OUT AWARE RESUME. A previous run that CONVERGED, or an explicit cfg.freshStart, must NOT be auto-resumed as if
+// still in progress -- otherwise re-running goalkeeper on the same repo for a NEW task just re-examines the finished
+// contract and "converges" again. A HALTED/in-progress run still auto-resumes by design (use freshStart to abandon it).
+const priorStatus = init.status || null
+const hasPriorState = !!((init.items && init.items.length) || (init.startIteration && init.startIteration > 0) || (init.passing && init.passing.length))
+const hasNewWork = !!(cfg.contractPath || (contract.items && contract.items.length) || (contract.goal && String(contract.goal).trim().length))
+if (priorStatus === 'converged' && !cfg.freshStart && !cfg.amendContract && !hasNewWork) {
+  return {
+    status: 'already-converged', passing: init.passing || [],
+    note: 'The previous goalkeeper run on this repo already converged; see ' + statePath + '/REPORT.md. To start a NEW task pass a new goal/contract (or freshStart:true); to wipe, delete ' + statePath + '.',
+  }
+}
+if ((cfg.freshStart === true || priorStatus === 'converged') && hasPriorState) {
+  await archiveStale(priorStatus === 'converged' ? 'converged' : 'freshStart')
+  init.items = []; init.goal = ''; init.passing = []; init.attempts = {}; init.fpHistory = []
+  init.startIteration = 0; init.replanCount = 0; init.critiqueRounds = 0
+}
+
 var prevGoodHead = init.prevGoodHead
 passingSet = new Set(init.passing || [])
 passingCount = passingSet.size
@@ -677,19 +745,21 @@ while (true) {
       if (!crit.satisfied) {
         return await escalate('self-critique-unactionable', { weaknesses: crit.weaknesses || [], summary: crit.summary || '' })
       }
-      // satisfied (no blocking weaknesses) -> converge and FLAG any minor weaknesses (fable step 4)
+      // satisfied (no blocking weaknesses) -> converge: write the completion report, then return (fable step 4)
+      const report1 = await closeOut({ head: finalV.headSha, iterations: iteration, weaknesses: crit.weaknesses || [] })
       return {
         status: 'converged', passing: Array.from(passingSet), head: finalV.headSha, iterations: iteration,
-        weaknesses: crit.weaknesses || [], selfCritiqueSummary: crit.summary || '',
-        summary: 'All ' + workingItems.length + ' contract items pass, the full suite is green, and self-critique found no blocking weaknesses.',
+        weaknesses: crit.weaknesses || [], selfCritiqueSummary: crit.summary || '', report: report1,
+        summary: 'All ' + workingItems.length + ' contract items pass, the full suite is green, and self-critique found no blocking weaknesses. Completion report written to ' + statePath + '/REPORT.md.',
       }
     }
 
-    // critique budget spent -> converge (do not loop forever on critique)
+    // critique budget spent -> converge: write the completion report, then return (do not loop forever on critique)
+    const report2 = await closeOut({ head: finalV.headSha, iterations: iteration, weaknesses: [] })
     return {
       status: 'converged', passing: Array.from(passingSet), head: finalV.headSha, iterations: iteration,
-      note: 'self-critique budget (maxCritiqueRounds=' + caps.maxCritiqueRounds + ') reached.',
-      summary: 'All ' + workingItems.length + ' contract items pass and the full suite is green.',
+      note: 'self-critique budget (maxCritiqueRounds=' + caps.maxCritiqueRounds + ') reached.', report: report2,
+      summary: 'All ' + workingItems.length + ' contract items pass and the full suite is green. Completion report written to ' + statePath + '/REPORT.md.',
     }
   }
 
