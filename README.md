@@ -42,16 +42,19 @@ It also has a planning and self-correction layer built in (a "fable-mode" workfl
 
 ## Optional power features (opt-in, default-off)
 
-Four extra capabilities are gated behind flags and **change nothing unless you turn them on**. With no flags set, Goalkeeper behaves exactly as described above.
+Seven extra capabilities are gated behind flags and **change nothing unless you turn them on**. With no flags set, Goalkeeper behaves exactly as described above.
 
 - **Best-of-N builders** (`caps.candidates` > 1, default 1). For a hard item, Goalkeeper builds **N diverse candidate solutions** and the **deterministic contract** (the independent verifier) picks the winner: there is **no LLM judge**. The candidates run **sequentially on the live repo** (each resets to last-good, builds a different approach guided by a diversity hint, is verified in place; the winning commit is promoted by cherry-pick), not in parallel worktrees. By default only **retries** fan out (`candidatesHardOnly`), so you pay the N-cost only where the loop is struggling, and N is capped (`maxCandidates`, default 6). If no candidate passes it is a normal failed round and item-stuck still bounds it. Cost: candidates multiply a round's build+verify token cost by up to N. A related `maxPlateau` stop (default 8) halts with reason `plateau` if the passing-count does not advance for that many rounds (a best-of-N backstop, since promoting a winner can move HEAD without a new item passing).
 - **Step memoization** (`memoize: true`, default false). Call-granular crash-resume: the expensive builder and verifier calls are keyed by a deterministic fingerprint of their inputs and their results stored in `.goalkeeper/results.json`, so a re-invocation returns a completed call's stored result instead of re-running it (no duplicate LLM spend). Invalidation is structural (a changed check or tree yields a different key), and a corrupt or missing ledger just degrades to recompute, so a stale result is never replayed.
 - **Durable approval token** (`approveToken: true`, default false). Instead of resolving an escalation by re-invoking with args, each escalation mints a deterministic token (shown in `ESCALATION.md`); a human writes `.goalkeeper/resolution.json` = `{ token, action }` (`action` is `approve` | `redirect` | `abandon` | `hint`) and the next invocation consumes it once, mapping it onto the existing resume levers. A token that does not match the active halt is ignored.
 - **Repo map** (`caps.repoMap`, default `'off'`). A cheap agent writes a token-bounded `.goalkeeper/repomap.md` (ranked key files in `'tree'` mode, plus top-level symbols via a ctags → git-grep → tree fallback in `'symbols'` mode; budget `caps.repoMapTokens`, default 1500) once at setup (refreshed after a re-plan/self-critique, or every `caps.repoMapRefreshEvery` rounds if > 0), and the planner and builder read it for grounding. It is git-ignored and never a gate.
+- **Verified pattern library** (`libraryPath`, default off). Point Goalkeeper at a cross-repo directory and every verifier-passed solution is **banked** there (the committed diff, secret-scrubbed, source repo recorded by basename only), keyed by the item description. When a later run **in any repo** starts a similar item, the most relevant banked patterns are **retrieved semantically and injected into the builder** as a "PROVEN PATTERNS" advisory block, so you stop re-solving the same primitive from scratch. It is **advisory only**: the independent verifier and the anti-gaming inspection are untouched, so a pattern can never make a wrong solution pass. Dedup (append / update / replace-variant) is decided deterministically by the script, and the library lives **outside** any repo's `.goalkeeper/`, so `freshStart` and state resets never touch it.
+- **Durable physical human-in-the-loop** (`humanGate: true` + a check's `humanPrecondition`, default off). For a check that cannot pass until a **person does something physical** (move a radio to the next room, reseat an SD card, power-cycle a board), Goalkeeper **suspends at zero compute** (status `awaiting-human`, **not** a failure and **not** counted against any anti-spin budget), writes `AWAITING-HUMAN.md` with a one-time token, and waits. The person performs the action, writes `resolution.json { token, action: "ready" }`, and re-invokes; the run latches the human step (recording the authorizing token) and proceeds to verify. The latch is per-tree by default (re-asks only when the baseline tree changes). A `humanPrecondition` with the gate **off** escalates (`human-gate-disabled`) rather than being silently skipped.
+- **CI-fix mode** (`fix: { command }`, default off). Point Goalkeeper at a single **red command** (a failing build / test / lint) and it synthesizes a one-item contract whose check *is* that command, captures the failing output to seed the first build, and drives the real command to green, without letting the builder edit or stub the command itself. It composes with every other feature (it is just a generated contract), and re-invoking with the same `fix` resumes the in-progress run.
 
 ### Turning the opt-in features on
 
-All four are off by default. Set the flag in the `args` you pass to the workflow (or just ask Claude, e.g. *"use goalkeeper on this repo with best-of-3 builders and the repo map on"*).
+All seven are off by default. Set the flag in the `args` you pass to the workflow (or just ask Claude, e.g. *"use goalkeeper on this repo with best-of-3 builders and the repo map on"*).
 
 **Best-of-N builders** (try several approaches to a hard item, keep the one the contract accepts):
 ```js
@@ -86,6 +89,30 @@ When a run halts, `ESCALATION.md` (and `plan.json`'s `activeToken`) carry a toke
 - `abandon`: archive the run and stop.
 
 The token is **consumed once** (the file is deleted and `activeToken` cleared on resume); a token that does not match the current halt is ignored, so a stale resolution can never fire on the wrong run.
+
+**Verified pattern library** (bank every passing solution to a cross-repo store and inject the relevant ones into future builds):
+```js
+libraryPath: "/path/to/goalkeeper-pattern-library"   // any directory, shared across repos; never reset by freshStart
+```
+Every verifier-passed item is banked there (diff + summary, secrets scrubbed, source repo recorded by basename only) and the patterns relevant to a later item are injected into the builder as advisory "PROVEN PATTERNS" context. Tune retrieval with `caps.libraryTopK` (default 3).
+
+**Durable physical human-in-the-loop** (suspend for a real-world action instead of failing the check):
+```js
+humanGate: true
+// ...and a check declares the physical step it depends on:
+// check: { type: "command", command: "./mesh-rx-check.sh", nondeterministic: true,
+//          humanPrecondition: "Move Unit B 50m away, power it on, and start the listener" }
+```
+When the loop reaches that item it suspends (status `awaiting-human`, no anti-spin budget consumed) and writes `AWAITING-HUMAN.md` with a one-time token. Perform the action, then write `<repo>/.goalkeeper/resolution.json` and re-invoke goalkeeper:
+```json
+{ "token": "gk-a1b2c3-human-d4e5f6", "action": "ready" }
+```
+
+**CI-fix mode** (drive a single red command to green):
+```js
+fix: { command: "npm test -- auth.spec", shell: "pwsh" }   // synthesizes a one-item contract whose check IS this command
+```
+Goalkeeper captures the failing output to seed the first build and drives the real command to exit 0, without letting the builder edit or stub the command itself. Re-invoking with the same `fix` resumes the in-progress run.
 
 ---
 
@@ -166,6 +193,9 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
           repoMap: "off" },      // opt-in repo map; 'off' (default) | 'tree' | 'symbols'
   memoize: false,                // opt-in call-granular crash-resume (skip re-running unchanged builder/verifier calls)
   approveToken: false,           // opt-in: resolve an escalation by writing .goalkeeper/resolution.json instead of re-invoking
+  libraryPath: null,             // opt-in: cross-repo verified-pattern library (bank every pass, inject relevant patterns into later builds)
+  humanGate: false,              // opt-in: suspend (awaiting-human) for a check's humanPrecondition until a person performs it and writes resolution.json
+  fix: null,                     // opt-in: CI-fix mode. { command, shell?, cwd?, env? } -> drive that one red command to green
   denylist: ["git push","deploy","secrets","external-send"],
   freshStart: false              // optional: archive any existing goalkeeper state (even an unfinished run) and start this task on a clean slate
 }})

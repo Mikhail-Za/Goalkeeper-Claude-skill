@@ -49,12 +49,12 @@
             "type": "object",
             "additionalProperties": false,
             "required": ["type"],
-            "description": "The objective, machine-checkable acceptance test. Exactly ONE payload field is expected, selected by `type`: type=command -> `command`; type=file_exists -> `path`; type=grep -> `pattern` (matched against the file/output at `path`); type=judge -> `rubric`.",
+            "description": "The objective, machine-checkable acceptance test. A base payload is selected by `type`: type=command -> `command`; type=file_exists -> `path`; type=grep -> `pattern` (matched against the file/output at `path`); type=judge -> `rubric`; type=pipeline -> `build`+`verify` (optional `deploy`). Any check may additionally carry the hardening modifiers below: `nondeterministic`/`passPolicy`/`precondition` (flaky/hardware checks), `shell`/`cwd`/`env` (run under a specific shell), and `humanPrecondition`/`humanRearm` (a physical step a person must perform first).",
             "properties": {
               "type": {
                 "type": "string",
-                "enum": ["command", "file_exists", "grep", "judge"],
-                "description": "Which kind of check this is. Determines which payload field is required."
+                "enum": ["command", "file_exists", "grep", "judge", "pipeline"],
+                "description": "Which kind of check this is. Determines which payload field(s) are required."
               },
               "command": {
                 "type": "string",
@@ -75,6 +75,75 @@
                 "type": "string",
                 "minLength": 1,
                 "description": "For type=judge: criteria an LLM judge applies to score the item pass or fail. Reserve for checks that genuinely cannot be expressed as a deterministic command."
+              },
+              "build": {
+                "type": "string",
+                "minLength": 1,
+                "description": "For type=pipeline: the build command, run first. A non-zero exit FAILS the check immediately and deploy/verify do not run (never deploy a failed build)."
+              },
+              "deploy": {
+                "type": "string",
+                "minLength": 1,
+                "description": "For type=pipeline: an optional deploy/flash command, run after a clean build and before verify."
+              },
+              "verify": {
+                "type": "string",
+                "minLength": 1,
+                "description": "For type=pipeline: the command that decides pass/fail, run after build (and deploy). The pipeline passes only if this exits 0."
+              },
+              "freshBuild": {
+                "type": "boolean",
+                "description": "For type=pipeline: force a clean/reconfigured build so a stale incremental artifact cannot masquerade as a passing deploy."
+              },
+              "nondeterministic": {
+                "type": "boolean",
+                "default": false,
+                "description": "Declare a check whose pass can depend on timing, hardware, a peer device, or the network. The verifier then retries per `passPolicy` and latches the git tree-hash on success, so a later flaky miss at the same code state is not read as a regression. An environment-dependent check MUST set this (the spec-review treats its absence as a blocking gap)."
+              },
+              "passPolicy": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "For a `nondeterministic` check: how many of how many retries must pass.",
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": ["latch", "k-of-n"],
+                    "description": "latch (default): pass if it succeeds at least once across n attempts. k-of-n: pass if it succeeds at least k of n times."
+                  },
+                  "k": { "type": "integer", "minimum": 1, "description": "For mode=k-of-n: minimum successes." },
+                  "n": { "type": "integer", "minimum": 1, "description": "Number of attempts (default 3)." }
+                }
+              },
+              "precondition": {
+                "type": "string",
+                "minLength": 1,
+                "description": "An optional command run before each attempt of a `nondeterministic` check (e.g. arm the radio, reset a fixture)."
+              },
+              "shell": {
+                "type": "string",
+                "enum": ["pwsh", "bash", "cmd", "sh"],
+                "description": "Pin the shell the check command runs under (instead of the runner's default). On Windows, pwsh = PowerShell (never MSYS), cmd = cmd.exe."
+              },
+              "cwd": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Working directory for the check command, relative to the repo root (default: repo root)."
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": { "type": "string" },
+                "description": "Environment variables set for the check command."
+              },
+              "humanPrecondition": {
+                "type": "string",
+                "minLength": 1,
+                "description": "A real-world action a PERSON must perform before this check can pass (e.g. 'move Unit B 50m away and start the listener'). Requires humanGate (or approveToken) enabled: the run suspends at zero compute (status awaiting-human) until the person confirms via resolution.json {token, action:\"ready\"}, then resumes and verifies. With the gate off, the run escalates (human-gate-disabled)."
+              },
+              "humanRearm": {
+                "type": "string",
+                "enum": ["per-tree", "per-run", "once"],
+                "default": "per-tree",
+                "description": "When a satisfied humanPrecondition re-arms (asks again): per-tree (default: only when the baseline tree changes), per-run (once per fresh invocation), once (never re-ask after the first confirmation)."
               }
             },
             "allOf": [
@@ -93,6 +162,10 @@
               {
                 "if": { "properties": { "type": { "const": "judge" } } },
                 "then": { "required": ["rubric"] }
+              },
+              {
+                "if": { "properties": { "type": { "const": "pipeline" } } },
+                "then": { "required": ["build", "verify"] }
               }
             ]
           },
@@ -100,6 +173,11 @@
             "type": "boolean",
             "default": false,
             "description": "Whether the builder may modify the files this check depends on. Default false. When false, the builder must satisfy the check as written and may NOT edit the check's files to make it pass (no moving the goalposts)."
+          },
+          "candidates": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional per-item best-of-N override (opt-in). When > 1 (or the global caps.candidates is > 1), this item is built by N diverse candidate solutions run sequentially on the live repo, and the deterministic verifier picks the winner. Default: inherit caps.candidates (1 = single builder)."
           }
         }
       }

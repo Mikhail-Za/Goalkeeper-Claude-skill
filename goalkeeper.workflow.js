@@ -90,6 +90,15 @@ const statePath = cfg.statePath || (repo ? repo + '/.goalkeeper' : '.goalkeeper'
 var approvals = cfg.approvals || [] // var (not const): the durable-approval-token path may push gates onto it (only when TOKEN_ON)
 const MEMO_ON = cfg.memoize === true       // C1: call-granular step memoization (opt-in, default OFF)
 const TOKEN_ON = cfg.approveToken === true // C2: durable approval token (opt-in, default OFF)
+// F2: durable human-in-the-loop for PHYSICAL steps (opt-in, default OFF). Reuses the C2 approval-token machinery; the
+// approveToken switch implies it (a token gate already exists), or it can be enabled on its own via humanGate:true.
+const HUMAN_ON = (cfg.humanGate === true) || (cfg.approveToken === true)
+// L1: cross-repo VERIFIED-PATTERN LIBRARY (opt-in, default OFF). Gated entirely on cfg.libraryPath = an ABSOLUTE dir path
+// OUTSIDE any repo, so verified solutions transfer across repos/boards. With it unset LIB_ON===false and the engine is
+// byte-for-byte as before: no library agent call is ever issued, no prompt string changes (the injection is '' and the
+// existing .filter(Boolean) drops it), the build memo key is untouched, and NO file is read or written.
+const LIB_ON = typeof cfg.libraryPath === 'string' && cfg.libraryPath.trim().length > 0
+const libraryPath = LIB_ON ? cfg.libraryPath.trim() : null
 const caps = Object.assign(
   {
     maxIterations: 20, maxItemRetries: 3, maxStalls: 3, maxTokens: null,
@@ -103,6 +112,9 @@ const caps = Object.assign(
     repoMap: 'off',          // repo-map grounding (opt-in): 'off' (default) | 'tree' (ranked file tree) | 'symbols' (ctags/grep symbols)
     repoMapTokens: 1500,     // token budget for the generated .goalkeeper/repomap.md
     repoMapRefreshEvery: 0,  // 0 = build once; N = also rebuild every N rounds (a re-plan/critique always refreshes)
+    libraryTopK: 3,          // L1 verified-pattern library: max banked patterns retrieved + injected per item (advisory)
+    libraryPatternMaxChars: 1500, // L1: per-pattern diff truncation when loading bodies for injection
+    libraryMaxVariantsPerProblem: 3, // L1: max distinct banked variants kept per problem (same descFp) before replace-LRU
   },
   cfg.caps || {}
 )
@@ -169,6 +181,9 @@ const STATE_INIT = {
     resultLedger: { type: 'object' }, // C1: replayable per-call results from <statePath>/results.json (empty unless MEMO_ON + contractId match)
     resolution: { type: 'object' },   // C2: parsed <statePath>/resolution.json (a human-written {token,action,...}) or null
     activeToken: { type: 'string' },  // C2: the outstanding approval token persisted in plan.json (or null)
+    humanSatisfied: { type: 'object' }, // F2: per-item human-precondition latch {<itemId>:{tree,runId,satisfied,at}}
+    awaitingHuman: { type: 'object' },  // F2: parked-item marker {id,token,baselineTree} when suspended for a human, else null
+    baselineTree: { type: 'string' },   // F2: git tree-hash of prevGoodHead (the latch key for per-tree human satisfaction)
   },
   required: ['initialized', 'prevGoodHead'],
 }
@@ -296,6 +311,49 @@ const REPOMAP_RESULT = {
   },
   required: ['written', 'tier'],
 }
+// CI-FIX mode: result of the one-shot baseline RED-log capture (run the check once as-is, do not modify files).
+const REDLOG_RESULT = {
+  type: 'object',
+  properties: {
+    ranRed: { type: 'boolean' },
+    exitZero: { type: 'boolean' },
+    outputTail: { type: 'string' },
+  },
+  required: ['ranRed', 'outputTail'],
+}
+// L1 verified-pattern library: result of the bank agent (computes+scrubs the verified diff, derives tags/summary, reads the
+// current index). entry is the full pattern body to persist; indexPatterns is the index.json patterns array it read (so the
+// SCRIPT can classify append/update/replace deterministically without re-reading).
+const BANK_RESULT = {
+  type: 'object',
+  properties: {
+    banked: { type: 'boolean' },
+    reason: { type: 'string' },
+    entry: { type: 'object' },
+    indexPatterns: { type: 'array', items: { type: 'object' } },
+  },
+  required: ['banked'],
+}
+// L1: result of the script-decided library write (append/update/replace-variant on index.json + the body file).
+const LIB_WRITE_RESULT = {
+  type: 'object',
+  properties: { written: { type: 'boolean' }, action: { type: 'string' }, patternId: { type: 'string' } },
+  required: ['written'],
+}
+// L1: result of the retrieval RANK over the lightweight index records (ids + reasons only; heavy bodies not read here).
+const RETRIEVE_RESULT = {
+  type: 'object',
+  properties: {
+    patterns: { type: 'array', items: { type: 'object', properties: { patternId: { type: 'string' }, reason: { type: 'string' } } } },
+  },
+  required: ['patterns'],
+}
+// L1: result of loading the selected pattern bodies for advisory injection.
+const LIB_BODIES_RESULT = {
+  type: 'object',
+  properties: { patterns: { type: 'array', items: { type: 'object' } } },
+  required: ['patterns'],
+}
 
 // ----------------------------------------------------------------------------
 // best-of-N: candidate approach hints (diversity discriminator; index k = APPROACH_HINTS[k % len]).
@@ -365,12 +423,17 @@ function budgetExhausted () {
 
 // Normalize an agent-proposed item into a full item with safe defaults.
 function normalizeItem (raw, fallbackPriority) {
+  // Preserve check.humanPrecondition/humanRearm (F2) -- they live INSIDE the check object, which is otherwise copied
+  // wholesale. Also fold the item-level alias raw.humanPrecondition onto the check so it survives normalize either way
+  // (humanPrecond() later reads from check OR item, so this is belt-and-suspenders and harmless when unset).
+  const check = raw.check || {}
+  if (raw.humanPrecondition && !check.humanPrecondition) check.humanPrecondition = raw.humanPrecondition
   return {
     id: raw.id || ('item-' + fallbackPriority),
     priority: (typeof raw.priority === 'number') ? raw.priority : fallbackPriority,
     description: raw.description || '',
     expectedOutput: raw.expectedOutput || '',
-    check: raw.check || {},
+    check: check,
     dependsOn: raw.dependsOn || [],
     allowTestEdit: !!raw.allowTestEdit,
   }
@@ -382,6 +445,38 @@ function dedupeById (items) {
   const out = []
   items.forEach(function (it) { if (!seen[it.id]) { seen[it.id] = true; out.push(it) } })
   return out
+}
+
+// CI-FIX mode (opt-in): synthesize a one-item contract whose CHECK is exactly the caller's currently-RED command, so the
+// existing loop drives that command to exit 0. Pure (no I/O). Returns { goal, items:[oneItem] }. Carries fix.humanPrecondition
+// onto the item untouched (a sibling feature owns the gate); buildFixContract only transports it.
+function buildFixContract (fix) {
+  const id = fix.id || 'ci-fix'
+  const priority = 1
+  const dependsOn = []
+  let check
+  if (fix.type === 'pipeline') {
+    check = { type: 'pipeline', build: fix.build, deploy: fix.deploy, verify: fix.verify, freshBuild: fix.freshBuild !== false }
+  } else {
+    check = { type: 'command', command: fix.command }
+  }
+  if (fix.shell) check.shell = fix.shell
+  if (fix.cwd) check.cwd = fix.cwd
+  if (fix.env) check.env = fix.env
+  if (fix.precondition) check.precondition = fix.precondition
+  // Firmware flash/serial checks are env-sensitive: DEFAULT to nondeterministic + latch so a flaky environmental miss
+  // cannot un-converge a tree that already passed. Opt out with nondeterministic:false.
+  const nd = (fix.nondeterministic !== false)
+  if (nd) { check.nondeterministic = true; check.passPolicy = fix.passPolicy || { mode: 'latch' } }
+  const cmdText = (fix.type === 'pipeline') ? (fix.build + ' && ' + fix.verify) : fix.command
+  const goal = (fix.goal && fix.goal.trim()) || ('Drive this currently-failing command to exit 0 (green): ' + cmdText)
+  const description = 'Make the project changes required so the command `' + cmdText + '` exits 0 (currently it is FAILING). Do NOT weaken, stub, or edit the command/harness itself; fix the underlying code/build so the real command passes.'
+  const expectedOutput = 'The command exits 0 (success). Its failing output is the signal for what to fix.'
+  const item = normalizeItem({ id: id, priority: priority, dependsOn: dependsOn, description: description, expectedOutput: expectedOutput, check: check, humanPrecondition: fix.humanPrecondition }, 1)
+  // normalizeItem only copies a fixed field set; carry humanPrecondition onto the item so the sibling feature (F2) that
+  // owns the gate sees it untouched. Only attach when set, so the item shape is otherwise unchanged.
+  if (fix.humanPrecondition) item.humanPrecondition = fix.humanPrecondition
+  return { goal: goal, items: [item] }
 }
 
 // Apply a re-plan request to the working item list (add and/or split). Pure.
@@ -408,6 +503,23 @@ function applyReplan (items, req) {
 // code is correct at that tree state; a later MISS at the SAME tree proves only that the environment did not cooperate.
 function isNondet (it) { return !!(it && it.check && it.check.nondeterministic === true) }
 function passMode (it) { return (it && it.check && it.check.passPolicy && it.check.passPolicy.mode) || 'latch' }
+
+// --- human-precondition helpers (F2) ---
+// A check may declare humanPrecondition: a real-world action a PERSON must perform before the check can pass (e.g. "move
+// Unit B 50m away and start the listener"). The ENGINE suspends at zero compute until the human confirms it (resolution
+// action "ready"); it never tries to perform or fake the action. The latch is per-tree by default (re-arms only when the
+// baseline tree changes), with 'per-run'/'once' as author escape hatches.
+function humanPrecond (it) { return (it && it.check && it.check.humanPrecondition) || (it && it.humanPrecondition) || null }
+function humanRearm (it) { return (it && it.check && it.check.humanRearm) || 'per-tree' }
+function humanSatisfiedFor (it, curTreeHash, humanSatisfied, runId) {
+  if (!humanPrecond(it)) return true
+  const rec = humanSatisfied[it.id]
+  if (!rec) return false
+  const mode = humanRearm(it)
+  if (mode === 'once') return rec.satisfied === true
+  if (mode === 'per-run') return rec.runId === runId
+  return rec.tree === curTreeHash // default per-tree: re-arm only when the baseline tree changes
+}
 
 // --- contract identity (for the resume gate) ---
 // Stable identity = normalized goal + sorted item ids. ids (not descriptions) so wording tweaks are not a "new contract".
@@ -436,6 +548,53 @@ function stableStringify (obj) {
   return '{' + keys.map(function (k) { return JSON.stringify(k) + ':' + stableStringify(obj[k]) }).join(',') + '}'
 }
 function shortFp (obj) { return fnv1a(stableStringify(obj)).slice(0, 7) }
+
+// --- L1 verified-pattern-library pure helpers (deterministic; reuse fnv1a/stableStringify/shortFp; no clock/RNG, no I/O) ---
+// Normalize a problem description so semantically-equal descriptions across repos collide: lowercase, punctuation->space,
+// whitespace collapsed. (This is the per-PROBLEM bucket key, not content.)
+function normDescription (d) {
+  return String(d || '').trim().replace(/\s+/g, ' ').replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').toLowerCase()
+}
+// 7-hex fingerprint of the PROBLEM (the bucket): equal problems -> equal descFp regardless of repo.
+function patternDescFp (description) { return fnv1a(normDescription(description)).slice(0, 7) }
+// 7-hex fingerprint of the SOLUTION content (the variant identity within a bucket): the verified diff + check + files.
+function patternContentFp (entry) {
+  return shortFp({ diff: entry.diff, check: entry.check, filesChanged: (entry.filesChanged || []).slice().sort() }).slice(0, 7)
+}
+// Stable pattern id = bucket + content, so the same solution to the same problem always maps to the same file/record.
+function patternId (descFp, contentFp) { return 'p-' + descFp + '-' + contentFp }
+// Decide how a freshly-verified pattern enters the bank, given the CURRENT index records (read by the bank agent):
+//   - same content already banked (fingerprint match) -> 'update' (bump provenance, never duplicate).
+//   - else a new VARIANT of the same problem: 'append' while under maxVariants, else 'replace-variant' evicting the
+//     least-useful same-problem variant (lowest timesRetrieved, tie-break lowest bankedAtIteration). Pure.
+function classifyBank (indexPatterns, descFp, contentFp, maxVariants) {
+  const list = indexPatterns || []
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] && list[i].fingerprint === contentFp) return { action: 'update' }
+  }
+  const sameProblem = list.filter(function (p) { return p && p.descFp === descFp })
+  if (sameProblem.length < maxVariants) return { action: 'append' }
+  var victim = null
+  sameProblem.forEach(function (p) {
+    if (victim === null) { victim = p; return }
+    const tr = (p.timesRetrieved || 0); const vtr = (victim.timesRetrieved || 0)
+    if (tr < vtr || (tr === vtr && (p.bankedAtIteration || 0) < (victim.bankedAtIteration || 0))) victim = p
+  })
+  return { action: 'replace-variant', dropPatternId: victim ? victim.id : null }
+}
+// Gate on whether a passed item is worth banking as a cross-repo pattern. ALL must hold (else not bankworthy):
+//   LIB_ON; the pass was a REAL implementation pass (NOT a purely-environmental latch hit with no change); HEAD actually
+//   advanced past the last-good baseline; the check is more than bare existence (a file_exists check that touched >1 file is
+//   still worth it); and the description is substantial enough to retrieve on later.
+function isBankworthy (item, build, prevGood, focalLatchHit) {
+  if (!LIB_ON) return false
+  if (focalLatchHit && !(build && build.headSha && build.headSha !== prevGood)) return false // environmental-only pass, no real work
+  if (!(build && build.headSha && build.headSha !== prevGood)) return false // HEAD advanced past last-good (filesChanged may be absent)
+  if (item && item.check && item.check.type === 'file_exists' && !((build.filesChanged || []).length > 1)) return false
+  if (String((item && item.description) || '').length < 12) return false
+  return true
+}
+
 // Deterministic memo key from loop state. candidateIdx is forward-compat for a future best-of-N (normally omitted).
 function memoKey (role, itemId, iter, inputObj, candidateIdx) {
   return role + ':' + itemId + '#' + iter + (typeof candidateIdx === 'number' ? (':cand' + candidateIdx) : '') + ':' + shortFp(inputObj)
@@ -543,7 +702,27 @@ const CHECK_SEMANTICS_NOTE = [
   '  deploying a STALE artifact from an incremental build that did not pick up new sources, do a clean/reconfigured build',
   '  when freshBuild:true is set OR whenever you cannot otherwise confirm the artifact was rebuilt from current source.',
   '  Only a clean build proceeds to deploy then verify; the check passes only if verify passes.',
+  '- precondition vs humanPrecondition (do NOT confuse them): a check\'s precondition is a COMMAND you run yourself to set',
+  '  up the environment before the check. A check\'s humanPrecondition is a real-world action a PERSON must physically',
+  '  perform (e.g. move a device, press a button, start hardware) -- you NEVER perform or fake it. The ENGINE suspends the',
+  '  whole run until a human confirms it, so by the time YOU are asked to run a check its humanPrecondition is already',
+  '  cleared: just run the check as-is. Never simulate, stub, or pretend a humanPrecondition is met.',
 ].join('\n')
+
+// CI-FIX mode: capture the item check's CURRENT (red) output ONCE, without changing anything, so the first builder
+// attempt is seeded with the real failing signal. Read-only: it runs the check as-is and reports the tail of its output.
+function captureRedLogPrompt (item) {
+  return [
+    'You are capturing a BASELINE. Do NOT modify any files, do NOT fix anything, do NOT commit. In repo ' + repo + ':',
+    'Run THIS check EXACTLY as-is, ONCE, honoring the execution semantics below (shell/cwd/env, pipeline ordering):',
+    '  ' + j(item.check),
+    '  (the check resolves against the repo root "' + repo + '": relative paths and commands run there.)',
+    CHECK_SEMANTICS_NOTE,
+    'Capture the LAST ~120 lines of its combined stdout+stderr.',
+    'Return REDLOG_RESULT { ranRed:true, exitZero:(true ONLY if the command already SUCCEEDED / exited 0, else false), outputTail:(those last ~120 lines) }.',
+    'If you could not run it at all, return ranRed:false with outputTail explaining why. Do NOT modify any files.',
+  ].join('\n')
+}
 
 function plannerPrompt (goalText) {
   return [
@@ -564,6 +743,10 @@ function plannerPrompt (goalText) {
     '{type:"pipeline", build, deploy, verify, freshBuild?} for build-and-deploy work so a build failure short-circuits',
     'BEFORE deploy (never deploy a stale/failed artifact). Declare nondeterministic for ANY check whose result can vary',
     'with the environment, so an environmental miss is not mistaken for a code failure.',
+    'HUMAN PRECONDITION: ONLY when a pass genuinely requires a PERSON to perform a physical real-world action first',
+    '(hardware/RF/serial setup the engine cannot do, e.g. "move Unit B 50m away and start the listener"), add',
+    'check.humanPrecondition: that exact human instruction -- goalkeeper will suspend and wait for a person before running',
+    'the check. Do NOT use it for anything a command can do (that is precondition); pure-software checks never need it.',
     (caps.repoMap !== 'off'
       ? 'REPO MAP: a compact structural map of this repo is at ' + statePath + '/repomap.md -- read it FIRST for grounding on key files and where things live (ranked, token-bounded, not exhaustive). If absent, proceed without it.'
       : ''),
@@ -588,6 +771,8 @@ function specReviewPrompt (goalText, items) {
     'because the loop would treat an environmental miss as a real code failure. BUILD/DEPLOY: a check that builds then',
     'deploys/measures should short-circuit on build failure (a {type:"pipeline"} check does); flag any deploy/measure',
     'check that could act on a stale artifact after a failed or no-op build.',
+    'HUMAN PRECONDITION: do NOT invent a check.humanPrecondition for a SOFTWARE check the engine can run unattended; it is',
+    'ONLY for a genuine physical/hardware action a person must perform (and an item that has one is NOT a gap for that reason).',
     'DISTRUST THE CHECK ITSELF (a check can be WRONG or GAMEABLE, not just incomplete): for each check ask (a) is it',
     'CORRECT -- does it actually test the goal, with no inverted/trivial/always-true assertion that would pass buggy code',
     'or fail correct code? and (b) is it CHEAT-RESISTANT -- would a trivial cheat pass it (hardcoding the exact expected',
@@ -610,11 +795,14 @@ function initPrompt () {
     '   ".goalkeeper/" to ' + repo + '/.git/info/exclude if not already present (create that file if needed).',
     '3. RUNTIME state -- if ' + statePath + '/plan.json exists, read it and return: passing[] item ids, prevGoodHead,',
     '   iteration as startIteration, attempts{} (per-item failed-attempt counts), fpHistory[] ({hash,pass,head} per round),',
-    '   latched{} (per-nondeterministic-item: the git tree-hash at which its check last passed), attemptLog{} (per-item',
+    '   latched{} (per-nondeterministic-item: the git tree-hash at which its check last passed),',
+    '   humanSatisfied{} (per-item human-precondition latch: the record proving a person performed the required physical',
+    '   action), awaitingHuman (the parked-item marker {id,token,baselineTree} when the run is suspended for a human, else',
+    '   null), baselineTree (the git tree-hash string the human latch is keyed to), attemptLog{} (per-item',
     '   recent failed-attempt reflections = the failure ledger), repoMapHead (git short-sha the repo map was last built at)',
     '   and repoMapIteration (the iteration it was built at) if present, and status (the plan.json "status" field, usually',
     '   "in-progress" or "converged").',
-    '   If it does not exist, seed: passing=[], startIteration=0, attempts={}, fpHistory=[], latched={}, attemptLog={}, repoMapHead=null, repoMapIteration=0, status="fresh", and',
+    '   If it does not exist, seed: passing=[], startIteration=0, attempts={}, fpHistory=[], latched={}, humanSatisfied={}, awaitingHuman=null, baselineTree=null, attemptLog={}, repoMapHead=null, repoMapIteration=0, status="fresh", and',
     '   set prevGoodHead to the current git HEAD sha (git -C "' + repo + '" rev-parse HEAD).',
     '4. WORKING CONTRACT -- if ' + statePath + '/contract.json exists, read it and return its items[], goal, replanCount,',
     '   critiqueRounds. If it does not exist, return items=[], goal="", replanCount=0, critiqueRounds=0.',
@@ -631,7 +819,7 @@ function initPrompt () {
          'otherwise (missing, unparseable, or contractId mismatch) return resultLedger = {} (an empty object). Never return ' +
          'a ledger from a different contract.')
       : ''),
-    (TOKEN_ON
+    ((TOKEN_ON || HUMAN_ON)
       ? ('8. DURABLE APPROVAL -- if ' + statePath + '/resolution.json exists and parses, return it as resolution (the parsed ' +
          'object); else resolution = null. Also return activeToken = the "activeToken" field from plan.json (the outstanding ' +
          'approval token) if present, else null.')
@@ -661,7 +849,7 @@ function ledgerWritePrompt (ledger, contractId) {
   ].join('\n')
 }
 
-function builderPrompt (item, goalText, priorAttempts, attemptNum, maxRetries) {
+function builderPrompt (item, goalText, priorAttempts, attemptNum, maxRetries, provenPatterns) {
   return [
     'You are the BUILDER in an autonomous build loop. Stay strictly on task.',
     'OVERALL GOAL (restated so you do not drift): ' + goalText,
@@ -681,10 +869,12 @@ function builderPrompt (item, goalText, priorAttempts, attemptNum, maxRetries) {
       ? ('YOUR PRIOR FAILED ATTEMPTS on this exact item (most recent last) -- do NOT repeat any of these approaches:\n' +
          priorAttempts.map(function (a) { return '  - round ' + a.iteration + ' (' + a.outcome + '): ' + (a.reflection || '') }).join('\n'))
       : 'No prior failed attempts on this item yet.'),
+    (fixCfg ? 'NOTE: a prior attempt tagged "initial-red" is the command\'s CURRENT failing output (the starting signal to fix), not a wrong approach you previously took.' : ''),
     'Further per-round detail is in ' + statePath + '/worklog.md.',
     (caps.repoMap !== 'off'
       ? 'REPO MAP: a compact structural map of this repo is at ' + statePath + '/repomap.md -- read it FIRST for grounding on where things live (key files + top-level symbols, ranked, token-bounded). It is a guide, not exhaustive; open the actual files you need. If absent, proceed without it.'
       : ''),
+    (LIB_ON && provenPatterns && provenPatterns.length ? renderProvenPatterns(provenPatterns) : ''),
     ((attemptNum && maxRetries && attemptNum >= (maxRetries - 1))
       ? ('LAST ATTEMPT: you have already failed this item ' + attemptNum + ' time(s); after this it is ESCALATED to a human. ' +
          'Do NOT iterate on the same approach -- take a FUNDAMENTALLY different one. If you are genuinely blocked, set ' +
@@ -707,7 +897,7 @@ function builderPrompt (item, goalText, priorAttempts, attemptNum, maxRetries) {
 // candidate starts from the same tree, (b) appends a per-candidate approach hint, (c) uses a candidate-tagged commit
 // message, (d) returns treeHash (no worktreePath -- candidates run on the live repo, not a worktree), (e) NO living-re-plan
 // block (a single candidate must not mutate the shared contract). priorAttempts/last-chance ledger + HARD RULES preserved.
-function candidateBuilderPrompt (item, goalText, priorAttempts, attemptNum, maxRetries, candidateIndex, n, prevGoodHead) {
+function candidateBuilderPrompt (item, goalText, priorAttempts, attemptNum, maxRetries, candidateIndex, n, prevGoodHead, provenPatterns) {
   const hint = APPROACH_HINTS[candidateIndex % APPROACH_HINTS.length]
   const g = 'git -C "' + repo + '"'
   return [
@@ -741,6 +931,7 @@ function candidateBuilderPrompt (item, goalText, priorAttempts, attemptNum, maxR
          'Take a FUNDAMENTALLY different approach from the prior attempts. If you are genuinely blocked, set blocked=true with a ' +
          'precise, specific blockerReason -- that is more useful than another failed guess.')
       : ''),
+    (LIB_ON && provenPatterns && provenPatterns.length ? renderProvenPatterns(provenPatterns) : ''),
     CHECK_SEMANTICS_NOTE,
     'YOUR DISTINCT APPROACH (candidate ' + candidateIndex + ' of ' + n + ', exploring a DISTINCT approach from the others): ' + hint,
     'WHEN DONE: run the item check yourself (honoring the semantics above), then commit ONLY your changes with the commit',
@@ -914,14 +1105,20 @@ function bookkeeperPrompt (data) {
     '2. Read ' + statePath + '/plan.json if present, then write it (RUNTIME state only) merged with: passing=' + j(data.passing) +
       ', attempts=' + j(data.attempts) + ', iteration=' + data.iteration + ', prevGoodHead=' + j(data.prevGoodHead) +
       ', latched=' + j(data.latched) + ' (per-nondeterministic-item tree-hash where its check last passed),' +
+      ' humanSatisfied=' + j(data.humanSatisfied) + ' (per-item human-precondition latch: a person performed the physical step),' +
       ' attemptLog=' + j(data.attemptLog) + ' (per-item recent failed-attempt reflections = the failure ledger),' +
       ' repoMapHead=' + j(data.repoMapHead) + ', repoMapIteration=' + j(data.repoMapIteration) + ' (repo-map staleness key),' +
       ' and APPEND this fingerprint (shape {hash,pass,head}) to fpHistory: ' + j(data.fingerprint) + '. Keep status="in-progress".',
+    (data.humanOn
+      ? ('2b. Also compute and persist baselineTree = the git tree-hash of the (post-revert) last-good HEAD: run ' +
+         'git -C "' + repo + '" rev-parse ' + j(data.prevGoodHead) + '^{tree} and write its output as the "baselineTree" field ' +
+         '(the key the per-tree human-precondition latch is bound to). Leave "awaitingHuman" as null (no parked human pause persists across a completed build round).')
+      : ''),
     '   (The working contract lives in the SEPARATE contract.json -- do NOT read or write it here.)',
     '3. APPEND one entry to ' + statePath + '/worklog.md:  round ' + data.iteration + ', item ' + data.item.id +
       ', outcome ' + data.outcome + ', reflection: ' + (data.reflection || '') + '  (be specific about WHY).',
     'Return BOOKKEEP_RESULT (reverted, headSha, persisted).',
-  ].join('\n')
+  ].filter(Boolean).join('\n')
 }
 
 // C2: a deterministic, human-resolvable token for a halt. Same halt (same contract + blocking item + iteration) -> same
@@ -981,6 +1178,60 @@ function escalationWritePrompt (payload) {
   ].filter(Boolean).join('\n')
 }
 
+// F2: payload for a PLANNED PAUSE awaiting a human physical action. Distinct from an escalation (which is a FAILURE): this
+// is a zero-compute suspend until a person confirms they performed the real-world precondition. The READY option tells the
+// human exactly how to resume (write resolution.json {token,action:"ready"} and re-invoke).
+function buildHumanPausePayload (item, instruction, token) {
+  return {
+    kind: 'awaiting-human',
+    reason: 'human-precondition',
+    goal: goalText,
+    mode: mode,
+    autonomy: autonomy,
+    progress: passingCount + '/' + workingItems.length + ' items passing',
+    passing: Array.from(passingSet),
+    blockingItem: item ? { id: item.id, description: item.description, check: item.check } : null,
+    humanAction: instruction,
+    rearm: humanRearm(item),
+    token: token,
+    decisionNeeded: 'A PERSON must perform the physical action below, then confirm it so goalkeeper can run the check.',
+    options: [
+      '1) READY (do this once the action is done): write ' + statePath + '/resolution.json containing {"token":"' + token +
+        '","action":"ready"} and re-invoke goalkeeper -- it will mark the precondition satisfied and proceed to build/verify.',
+      '2) skip: write {"token":"' + token + '","action":"redirect", "amendItems":[...]} to replace this item, or pass freshStart:true to abandon the run.',
+      '3) abandon: write {"token":"' + token + '","action":"abandon"} to archive this run.',
+    ],
+    resume: 'PLANNED PAUSE (not a failure): no retry/iteration/no-progress was consumed. State persisted in ' + statePath +
+      '/plan.json. Perform the action, then write the READY resolution.json above and re-invoke goalkeeper.',
+  }
+}
+
+// F2: a clone of escalationWritePrompt that writes AWAITING-HUMAN.md (the human action + the READY resolution.json line
+// rendered PROMINENTLY at the top) and records BOTH the outstanding token AND the parked-item marker (awaitingHuman) in
+// plan.json via read-merge-write. Telegram is best-effort, identical to an escalation.
+function humanPauseWritePrompt (payload) {
+  const item = payload.blockingItem || {}
+  return [
+    'Write a PLANNED HUMAN PAUSE (NOT a failure/escalation): goalkeeper is suspending until a PERSON performs a physical',
+    'real-world action. The on-disk file is the SYSTEM OF RECORD; Telegram is best-effort only.',
+    '1. Write ' + statePath + '/AWAITING-HUMAN.md from this payload. Render PROMINENTLY NEAR THE TOP, before anything else:',
+    '   (a) the HUMAN ACTION to perform:  ' + String(payload.humanAction || '') ,
+    '   (b) the exact READY step:  write ' + statePath + '/resolution.json containing {"token":"' + payload.token +
+      '","action":"ready"} and then re-invoke goalkeeper.',
+    '   Then render the rest clearly (Goal restated, Reason: awaiting human precondition, Progress, Blocking item, Options,',
+    '   Resume instructions). Payload: ' + j(payload),
+    '1b. Render the resolution TOKEN prominently near the top too (e.g. a "Resolution token: ' + payload.token + '" line).',
+    '1c. Record the outstanding token AND the parked-item marker in plan.json: read ' + statePath + '/plan.json, set its',
+    '   "activeToken" field to "' + payload.token + '", set its "awaitingHuman" field to ' +
+      j({ id: item.id || null, token: payload.token, baselineTree: baselineTree }) + ', and write it back',
+    '   (read-merge-write; keep every other field unchanged).',
+    '2. If telegram.chatId is set (' + j(telegram) + ') AND a telegram reply/send tool is reachable via ToolSearch,',
+    '   send a one-paragraph summary of the physical action needed, ending with "see AWAITING-HUMAN.md". If not reachable,',
+    '   skip silently -- do NOT fail the task over Telegram being down.',
+    'Return ESCALATION_RESULT.',
+  ].filter(Boolean).join('\n')
+}
+
 function closeOutPrompt (data) {
   return [
     'The goalkeeper run CONVERGED (success). Write the completion report, in repo ' + repo + ' (state dir ' + statePath + ').',
@@ -1012,9 +1263,9 @@ function archiveStalePrompt (reason) {
     '1. Compute a short id: git -C "' + repo + '" rev-parse --short HEAD .',
     '2. Create directory ' + statePath + '/archive/' + reason + '-<short> .',
     '3. MOVE (not copy) these files from ' + statePath + '/ into that archive dir IF they exist: plan.json, contract.json,',
-    '   worklog.md, REPORT.md, ESCALATION.md' +
-      ((MEMO_ON || TOKEN_ON) ? ', results.json, resolution.json' : '') + '.' +
-      ((MEMO_ON || TOKEN_ON) ? ' (Moving results.json/resolution.json prevents a stale memo ledger or approval from carrying into a new task.)' : ''),
+    '   worklog.md, REPORT.md, ESCALATION.md, AWAITING-HUMAN.md' +
+      ((MEMO_ON || TOKEN_ON || HUMAN_ON) ? ', results.json, resolution.json' : '') + '.' +
+      ((MEMO_ON || TOKEN_ON || HUMAN_ON) ? ' (Moving results.json/resolution.json prevents a stale memo ledger or approval/human-resolution from carrying into a new task.)' : ''),
     '4. Afterward the active ' + statePath + '/ MUST contain NO plan.json and NO contract.json (only the archive/ subdir).',
     'Do NOT touch git or source files. Return ARCHIVE_RESULT { archived: true, path: "<archive dir>" }.',
   ].join('\n')
@@ -1041,6 +1292,132 @@ function repoMapPrompt () {
 }
 
 // ----------------------------------------------------------------------------
+// L1 verified-pattern-library prompt builders (only ever invoked when LIB_ON). The SCRIPT does no I/O: these agents do all
+// the reads/writes/semantic-matching at the cross-repo libraryPath. The verifier remains the sole pass authority -- patterns
+// are ADVISORY input to the builder and are always re-checked from scratch.
+// ----------------------------------------------------------------------------
+// BANK: after a verified pass, compute+scrub the verified diff, derive tags/summary, read the current index, and return the
+// full pattern body to persist (the SCRIPT then classifies append/update/replace and issues libWritePrompt).
+function bankPatternPrompt (item, prevGoodHead, headSha, descFp) {
+  const g = 'git -C "' + repo + '"'
+  return [
+    'You are BANKING a VERIFIED solution into the cross-repo pattern library. The independent verifier already PASSED this',
+    'item at HEAD ' + headSha + ' in repo ' + repo + '; you are only extracting + recording the proven change. Do NOT modify',
+    'any files in the repo, do NOT commit, do NOT run the check.',
+    '(a) Compute the verified diff:  ' + g + ' diff ' + prevGoodHead + ' ' + headSha + '   -- this is the exact change that passed.',
+    '(b) SCRUB SECRETS before recording (this body may be shared across repos):',
+    '    - Redact any LINE that looks like a secret to the literal text "<redacted:secret>": API keys/tokens, Authorization',
+    '      headers, .env-style assignments of *_KEY / *_TOKEN / *_SECRET / PASSWORD, and PEM blocks (BEGIN/END ... PRIVATE KEY).',
+    '    - SKIP whole hunks belonging to obvious secret FILES: .env* , *.pem , id_rsa* , credentials* (drop those file hunks entirely).',
+    '    - If, AFTER scrubbing, the diff is empty (it was entirely secrets), return BANK_RESULT { banked:false, reason:"diff empty after redaction" }.',
+    '(c) Derive 3-8 short technical tags (e.g. "argv-parsing","retry-backoff","sqlite-migration") and a one-paragraph summary',
+    '    of WHAT the change does and WHY it satisfies the check (no secrets).',
+    '(d) Read ' + libraryPath + '/index.json . If it is missing or not valid JSON, treat it as { version:1, patterns:[] }.',
+    '(e) Return BANK_RESULT { banked:true, entry, indexPatterns } where indexPatterns is that index.json "patterns" array',
+    '    (as-read, or [] if it was missing/corrupt), and entry is EXACTLY:',
+    '      {',
+    '        description: ' + j(String(item.description || '')) + ' ,   // VERBATIM, unchanged (the retrieval bucket key)',
+    '        tags: [...], summary: "...",',
+    '        check: ' + j(item.check) + ' ,',
+    '        expectedOutput: ' + j(String(item.expectedOutput || '')) + ' ,',
+    '        filesChanged: [the repo-relative paths the scrubbed diff touches],',
+    '        diff: "<the SCRUBBED unified diff>",',
+    '        sourceRepoName: "<the BASENAME of ' + repo + ' only, NOT the full path>",',
+    '        sourceGoalHash: "' + fnv1a(goalText) + '" ,',
+    '        fingerprint: "<compute it the SAME way the engine does: the first 7 hex chars of an FNV-1a-32 hash over a',
+    '          recursively key-SORTED JSON of exactly { check, diff, filesChanged } where filesChanged is sorted ascending;',
+    '          this MUST be reproducible, so use the scrubbed diff + this check + the sorted filesChanged>",',
+    '        bankedAtIteration: ' + iteration,
+    '      }',
+    'The descFp for this problem is "' + descFp + '" (informational; the engine recomputes it). Return ONLY BANK_RESULT.',
+  ].join('\n')
+}
+
+// LIB WRITE: perform the SCRIPT-decided write (append | update | replace-variant) by read-merge-writing index.json and the
+// patterns/<id>.json body. Never clobbers unrelated entries. (The script picked the action + any dropPatternId; the agent executes.)
+function libWritePrompt (libraryPath, action, entry, dropPatternId) {
+  const idxPath = libraryPath + '/index.json'
+  const bodyPath = libraryPath + '/patterns/' + entry.id + '.json'
+  const record = {
+    id: entry.id, description: entry.description, tags: entry.tags, summary: entry.summary,
+    checkKind: (entry.check && entry.check.type) || 'unknown', sourceRepoName: entry.sourceRepoName,
+    sourceGoalHash: entry.sourceGoalHash, fingerprint: entry.fingerprint, descFp: patternDescFp(entry.description),
+    bankedAtIteration: entry.bankedAtIteration,
+  }
+  return [
+    'Persist ONE verified pattern into the cross-repo library at ' + libraryPath + '. Create ' + libraryPath + ' and',
+    ' ' + libraryPath + '/patterns/ if they do not exist. The action was decided by the engine: "' + action + '".',
+    'Read ' + idxPath + ' (if missing or not valid JSON, start from { "version":1, "patterns":[] }). Then:',
+    (action === 'update'
+      ? ('UPDATE (this exact solution is already banked): find the existing index record whose "fingerprint" === "' + entry.fingerprint +
+         '". Increment its "timesBanked" (treat missing as 1 -> 2) and refresh its provenance fields (sourceRepoName="' +
+         entry.sourceRepoName + '", sourceGoalHash="' + entry.sourceGoalHash + '", bankedAtIteration=' + entry.bankedAtIteration +
+         '). Do NOT add a second record and do NOT change its id. Also OVERWRITE the body file ' + bodyPath + ' with the full entry below (refreshed).')
+      : (action === 'replace-variant'
+        ? ('REPLACE-VARIANT: (1) APPEND the new lightweight record below to patterns[] and WRITE the full body ' + bodyPath + '; (2) then EVICT the superseded variant: remove the index record whose "id" === "' + String(dropPatternId) + '" and DELETE the file ' + libraryPath + '/patterns/' + String(dropPatternId) + '.json if it exists. Touch NO other records.')
+        : ('APPEND: add the new lightweight record below to patterns[] (do NOT modify any existing record) and WRITE the full body ' + bodyPath + '.'))),
+    'The lightweight INDEX record (keep index.json small -- bodies live in patterns/<id>.json) is EXACTLY:',
+    '  ' + j(record) + (action === 'append' || action === 'replace-variant' ? ' (set its "timesBanked":1, "timesRetrieved":0)' : ''),
+    'The FULL body to write at ' + bodyPath + ' is EXACTLY:',
+    '  ' + j(entry),
+    'Write index.json back via read-merge-write (preserve "version" and every unrelated record). Never clobber an unrelated entry.',
+    'Return LIB_WRITE_RESULT { written:true, action:"' + action + '", patternId:"' + entry.id + '" } only on success.',
+  ].join('\n')
+}
+
+// RETRIEVE (rank): read the lightweight index, semantically rank its records against THIS item, return top-K ids+reasons.
+// Reads the index ONLY (not the heavy bodies).
+function retrievePatternsPrompt (item, libraryPath, topK) {
+  return [
+    'You are RETRIEVING advisory prior-art for a NEW build item from the cross-repo verified-pattern library.',
+    'Read ' + libraryPath + '/index.json (if missing or not valid JSON, there are no patterns -> return { "patterns": [] }).',
+    'Each index record has: id, description, tags, summary, checkKind, sourceRepoName. Do NOT read the heavy patterns/<id>.json bodies.',
+    'THIS new item:',
+    '  description: ' + j(String(item.description || '')),
+    '  expectedOutput: ' + j(String(item.expectedOutput || '')),
+    '  check: ' + j(item.check),
+    'Semantically RANK the index records by how relevant each is to solving THIS item (a record from another repo can be',
+    'highly relevant if the underlying problem/technique matches; an unrelated record is not). Return RETRIEVE_RESULT',
+    '{ patterns: [{ patternId, reason }] } with ONLY the top ' + topK + ' most relevant (fewer if fewer are relevant; empty',
+    'if none are). patternId MUST be an "id" from the index; reason = one short clause on why it is relevant. Do NOT modify any files.',
+  ].join('\n')
+}
+
+// LIB LOAD: read the chosen pattern bodies and return them (diff truncated) for advisory injection into the builder.
+function libLoadPatternsPrompt (libraryPath, ids, perPatternMaxChars) {
+  return [
+    'Load these verified-pattern BODIES from the cross-repo library for advisory injection. Read each file',
+    ' ' + libraryPath + '/patterns/<id>.json for id in: ' + j(ids) + ' (skip any that are missing or not valid JSON).',
+    'For each one return: patternId (its id), description, summary, filesChanged, check, and diff TRUNCATED to at most ' +
+      perPatternMaxChars + ' characters (if you truncate it, append the literal note "(diff truncated)" at the end of the diff string).',
+    'Return LIB_BODIES_RESULT { patterns: [{ patternId, description, summary, filesChanged, diff, check }] }, preserving the',
+    'input id order. Do NOT modify any files.',
+  ].join('\n')
+}
+
+// PURE string formatter: render loaded patterns as a clearly-ADVISORY block for the builder. It is framed so it can never
+// read as relaxing a rule: these merely PASSED an independent verifier on SIMILAR problems in OTHER repos; they are a
+// starting point, NOT a guarantee; the verifier WILL re-check from scratch; adapt, do not blind-paste.
+function renderProvenPatterns (patterns) {
+  const lines = [
+    'PROVEN PATTERNS (advisory -- NOT a relaxation of any rule):',
+    'The patterns below each PASSED an INDEPENDENT verifier on a SIMILAR problem in a DIFFERENT repo. They are a STARTING',
+    'POINT, not a guarantee for THIS item: the independent verifier will re-check your work FROM SCRATCH regardless. ADAPT',
+    'them to this codebase and this item; do NOT blindly paste, and do NOT treat their presence as permission to skip work',
+    'or weaken the check. If none fit, ignore them and implement directly.',
+  ]
+  ;(patterns || []).forEach(function (p, k) {
+    lines.push('--- pattern ' + (k + 1) + ' ---')
+    lines.push('description: ' + String((p && p.description) || ''))
+    if (p && p.reason) lines.push('(why relevant: ' + String(p.reason) + ')')
+    if (p && p.summary) lines.push('summary: ' + String(p.summary))
+    lines.push('files: ' + j((p && p.filesChanged) || []))
+    lines.push('diff:\n' + String((p && p.diff) || ''))
+  })
+  return lines.join('\n')
+}
+
+// ----------------------------------------------------------------------------
 // Mutable run state (declared before escalate() so payloads can read them)
 // ----------------------------------------------------------------------------
 var passingSet = new Set()
@@ -1058,6 +1435,32 @@ async function escalate (reason, detail) {
     res = { written: false, note: 'escalation agent failed: ' + String(e) }
   }
   return { status: 'halted', reason: reason, progress: payload.progress, passing: Array.from(passingSet), escalation: res, payload: payload }
+}
+
+// F2: SUSPEND the run for a human physical precondition (a PLANNED PAUSE, not a failure). Mints a durable token (reusing
+// the C2 token machinery), writes AWAITING-HUMAN.md + records the parked-item marker, and returns the new awaiting-human
+// status at ZERO compute. The CALLER invokes this BEFORE any anti-spin counter mutates, so a pause never trips
+// item-stuck/no-progress/oscillation/plateau/budget and never consumes a retry/iteration.
+async function suspendForHuman (item) {
+  const inst = humanPrecond(item)
+  const token = mintToken('human', { item: item })
+  log('SUSPEND (awaiting human): ' + item.id)
+  const payload = buildHumanPausePayload(item, inst, token)
+  var res = null
+  try {
+    res = await agent(humanPauseWritePrompt(payload), { label: 'await-human:' + item.id, phase: 'Escalate', effort: 'low', schema: ESCALATION_RESULT })
+  } catch (e) {
+    res = { written: false }
+  }
+  return {
+    status: 'awaiting-human', reason: 'human-precondition',
+    item: { id: item.id, humanPrecondition: inst }, token: token,
+    progress: passingCount + '/' + workingItems.length + ' items passing',
+    passing: Array.from(passingSet),
+    note: 'Planned pause: perform the physical action, then write ' + statePath + '/resolution.json {"token":"' + token +
+      '","action":"ready"} and re-invoke. This pause did NOT consume a retry/iteration/no-progress.',
+    awaiting: res,
+  }
 }
 
 async function persistContract (counters) {
@@ -1169,6 +1572,23 @@ async function applyResolution (res) {
     log('resolution: redirect (' + ((res.amendItems && res.amendItems.length) || 0) + ' item(s))')
     return null
   }
+  if (action === 'ready') {
+    // F2: the human performed the physical precondition. Latch it for the parked item so the loop proceeds straight to
+    // build/verify on re-invoke. Touches ONLY the humanSatisfied latch -- NO retries/attemptLog/fpHistory/iteration -- so a
+    // planned pause never costs an attempt or trips an anti-spin counter. The id comes from res.itemId (as the other
+    // branches read it) or, failing that, the parked-item marker persisted at suspend.
+    const id = itemId || (init && init.awaitingHuman && init.awaitingHuman.id) || null
+    if (id) {
+      const tree = (init && init.awaitingHuman && init.awaitingHuman.baselineTree) || baselineTree
+      // Record the authorizing token so plan.json is auditable against AWAITING-HUMAN.md (which token unlocked the gate).
+      // res is the token-validated init.resolution (token === activeToken was checked before applyResolution ran).
+      humanSatisfied[id] = { tree: tree, runId: runId, satisfied: true, at: iteration, token: (res && res.token) || null }
+      log('resolution: ready -> human precondition satisfied for ' + id)
+    } else {
+      log('resolution: ready but no item id; ignoring')
+    }
+    return null
+  }
   if (action === 'abandon') {
     await archiveStale('abandoned')
     log('resolution: abandon')
@@ -1180,7 +1600,7 @@ async function applyResolution (res) {
 
 // Best-effort: delete resolution.json and clear plan.json activeToken once a resolution has been applied.
 async function consumeResolution (token) {
-  if (!TOKEN_ON) return
+  if (!TOKEN_ON && !HUMAN_ON) return
   try {
     await agent(resolutionConsumePrompt(token), { label: 'resolution-consume', phase: 'Plan', effort: 'low', schema: PERSIST_RESULT })
   } catch (e) { log('resolution consume failed (non-fatal): ' + String(e)) }
@@ -1191,8 +1611,9 @@ function resolutionConsumePrompt (token) {
     'A durable goalkeeper approval token has been CONSUMED; clear it so it cannot be re-applied, in repo ' + repo + ' (state dir ' + statePath + ').',
     'Token: ' + token,
     '1. Delete the file ' + statePath + '/resolution.json if it exists (it has been applied).',
-    '2. Read ' + statePath + '/plan.json, clear its "activeToken" field (set it to null or remove it), and write it back',
-    '   (read-merge-write; keep every other field unchanged).',
+    '2. Read ' + statePath + '/plan.json, clear its "activeToken" field (set it to null or remove it), AND clear its',
+    '   "awaitingHuman" field (set it to null) since any parked human-precondition has now been resolved, then write it',
+    '   back (read-merge-write; keep every other field unchanged).',
     'Do NOT touch git or source files. Return PERSIST_RESULT { persisted: true } only on success.',
   ].join('\n')
 }
@@ -1210,6 +1631,59 @@ async function ensureRepoMap (reason) {
     if (r && r.written) { repoMapExists = true; repoMapDirty = false; repoMapHead = r.headShort || repoMapHead; lastRepoMapIteration = iteration }
     return r || { written: false }
   } catch (e) { log('repomap build failed (non-fatal): ' + String(e)); return { written: false } }
+}
+
+// ----------------------------------------------------------------------------
+// L1 verified-pattern-library orchestration (opt-in via cfg.libraryPath). Both are no-ops when !LIB_ON and degrade-safe
+// (any failure -> empty/skip), so the library can never break a run. The SCRIPT issues the agent calls + makes the
+// append/update/replace DECISION deterministically; the agents do every read/write/semantic-match.
+// ----------------------------------------------------------------------------
+// Retrieve relevant banked patterns for an item -> advisory bodies for the builder. Two cheap agent calls (rank the index,
+// then load the chosen bodies). Run-scoped cache so an item retrieved once (e.g. across retries) is not re-ranked.
+async function retrievePatterns (item) {
+  if (!LIB_ON) return []
+  if (retrievalCache[item.id]) return retrievalCache[item.id]
+  try {
+    const ranked = await agent(retrievePatternsPrompt(item, libraryPath, caps.libraryTopK),
+      { label: 'lib-retrieve:' + item.id, phase: 'Loop', effort: 'low', schema: RETRIEVE_RESULT })
+    const picks = (ranked && ranked.patterns ? ranked.patterns : []).filter(function (p) { return p && p.patternId }).slice(0, caps.libraryTopK)
+    if (!picks.length) { retrievalCache[item.id] = []; return [] }
+    const ids = picks.map(function (p) { return p.patternId })
+    const reasonById = {}; picks.forEach(function (p) { reasonById[p.patternId] = p.reason || '' })
+    const loaded = await agent(libLoadPatternsPrompt(libraryPath, ids, caps.libraryPatternMaxChars),
+      { label: 'lib-load:' + item.id, phase: 'Loop', effort: 'low', schema: LIB_BODIES_RESULT })
+    const bodies = (loaded && loaded.patterns) ? loaded.patterns : []
+    // Merge reasons by patternId, preserving the rank order the retriever returned.
+    const byId = {}; bodies.forEach(function (b) { if (b && b.patternId) byId[b.patternId] = b })
+    const merged = ids.map(function (id) {
+      const b = byId[id] || { patternId: id }
+      return Object.assign({}, b, { reason: reasonById[id] || b.reason || '' })
+    }).filter(function (b) { return b && (b.diff || b.summary || b.description) })
+    retrievalCache[item.id] = merged
+    return merged
+  } catch (e) { log('lib retrieve failed (non-fatal): ' + String(e)); return [] }
+}
+
+// Bank a VERIFIED pass as a reusable cross-repo pattern. No-op unless LIB_ON + bankworthy + not already banked this run.
+// Two-call flow: (1) the bank agent computes/scrubs the diff + reads the index; (2) the SCRIPT classifies the write
+// deterministically; (3) the libWrite agent performs the chosen append/update/replace. Degrade-safe.
+async function bankPattern (item, prevGood, headSha, build, focalLatchHit) {
+  if (!LIB_ON || !isBankworthy(item, build, prevGood, focalLatchHit) || bankedThisRun.has(item.id)) return
+  try {
+    const descFp = patternDescFp(item.description)
+    const banked = await agent(bankPatternPrompt(item, prevGood, headSha, descFp),
+      { label: 'lib-bank:' + item.id, phase: 'Loop', effort: 'low', schema: BANK_RESULT })
+    if (!banked || banked.banked !== true || !banked.entry || !banked.entry.diff) return
+    const entry = banked.entry
+    const contentFp = patternContentFp(entry) // script-authoritative (NOT the agent's in-prompt FNV) so cross-repo dedup/update is deterministic
+    const decision = classifyBank(banked.indexPatterns || [], descFp, contentFp, caps.libraryMaxVariantsPerProblem)
+    entry.id = patternId(descFp, contentFp)
+    entry.fingerprint = contentFp
+    const w = await agent(libWritePrompt(libraryPath, decision.action, entry, decision.dropPatternId),
+      { label: 'lib-write:' + item.id, phase: 'Loop', effort: 'low', schema: LIB_WRITE_RESULT })
+    bankedThisRun.add(item.id)
+    log('banked pattern ' + entry.id + ' (' + decision.action + ') from item ' + item.id + (w && w.written ? '' : ' [write unconfirmed]'))
+  } catch (e) { log('lib bank failed (non-fatal): ' + String(e)) }
 }
 
 // ----------------------------------------------------------------------------
@@ -1248,7 +1722,10 @@ if (cfg.contractPath && !init.fileContract) {
 // contract and "converges" again. A HALTED/in-progress run still auto-resumes by design (use freshStart to abandon it).
 const priorStatus = init.status || null
 const hasPriorState = !!((init.items && init.items.length) || (init.startIteration && init.startIteration > 0) || (init.passing && init.passing.length))
-const hasNewWork = !!(cfg.contractPath || (contract.items && contract.items.length) || (contract.goal && String(contract.goal).trim().length))
+// CI-FIX mode (opt-in, default OFF): a fix entry is present only when it is an object carrying a command (or a pipeline).
+// fixCfg===null preserves byte-for-byte behavior; every new code path below is guarded on it.
+const fixCfg = (cfg.fix && typeof cfg.fix === 'object' && (cfg.fix.command || cfg.fix.type === 'pipeline')) ? cfg.fix : null
+const hasNewWork = !!(cfg.contractPath || (contract.items && contract.items.length) || (contract.goal && String(contract.goal).trim().length) || fixCfg)
 if (priorStatus === 'converged' && !cfg.freshStart && !cfg.amendContract && !hasNewWork) {
   return {
     status: 'already-converged', passing: init.passing || [],
@@ -1259,6 +1736,7 @@ if ((cfg.freshStart === true || priorStatus === 'converged') && hasPriorState) {
   await archiveStale(priorStatus === 'converged' ? 'converged' : 'freshStart')
   init.items = []; init.goal = ''; init.passing = []; init.attempts = {}; init.fpHistory = []
   init.startIteration = 0; init.replanCount = 0; init.critiqueRounds = 0
+  init.resolution = null; init.activeToken = null; init.awaitingHuman = null // abandon/converge also drops any UNCONSUMED resolution/token so it cannot bleed into the new task
 }
 
 // CONTRACT-IDENTITY RESUME GATE. A HALTED/in-progress run auto-resumes ONLY when the incoming invocation is the SAME
@@ -1270,9 +1748,12 @@ if ((cfg.freshStart === true || priorStatus === 'converged') && hasPriorState) {
 const hasPersistedContract = !!(init.items && init.items.length)
 if (hasPersistedContract && hasNewWork && !cfg.freshStart && !cfg.amendContract) {
   const incFile = init.fileContract || null
-  const incItems = (incFile && incFile.items && incFile.items.length) ? incFile.items
+  var incItems = (incFile && incFile.items && incFile.items.length) ? incFile.items
     : (contract.items && contract.items.length) ? contract.items : null
-  const incGoal = (incFile && incFile.goal) || contract.goal || ''
+  var incGoal = (incFile && incFile.goal) || contract.goal || ''
+  // CI-fix resume: a pure cfg.fix re-invocation carries NO inline contract, so derive the incoming identity from the SAME
+  // synthesized fix contract (deterministic). Without this it would compare "<synth goal>|" vs "|" and false-halt a fix resume.
+  if (fixCfg && !incItems) { const fc = buildFixContract(fixCfg); incItems = fc.items; incGoal = fc.goal }
   const persistedCmp = incItems ? contractIdentity(init.goal, init.items) : contractIdentity(init.goal, [])
   const incomingCmp = incItems ? contractIdentity(incGoal || init.goal, incItems) : contractIdentity(incGoal, [])
   if (incomingCmp !== persistedCmp) {
@@ -1295,10 +1776,20 @@ const humanAmended = (cfg.resetAttempts || []).length > 0
 ;(cfg.resetAttempts || []).forEach(function (id) { delete retries[id] })
 const fpHistory = (init.fpHistory || []).slice()
 var latched = Object.assign({}, init.latched || {}) // per-nondeterministic-item: tree-hash where its check last passed
+var humanSatisfied = Object.assign({}, init.humanSatisfied || {}) // F2: per-item human-precondition latch (a person performed the physical step)
+var baselineTree = init.baselineTree || null // F2: git tree-hash of prevGoodHead; the key the per-tree human latch is bound to
+// F2: a stable id for THIS run, for the 'per-run' human-rearm escape hatch. Deterministic (no clock/RNG): derived from the
+// run's starting coordinates so it round-trips on resume of the SAME parked run but differs once the run actually advances.
+const runId = fnv1a(stableStringify({ start: init.startIteration || 0, head: init.prevGoodHead || '', passing: (init.passing || []).slice().sort() }))
 var attemptLog = Object.assign({}, init.attemptLog || {}) // per-item recent failed-attempt reflections (the failure ledger)
 ;(cfg.resetAttempts || []).forEach(function (id) { delete attemptLog[id] }) // a human attempt-reset clears the ledger too, so stale "do not repeat" guidance cannot contradict the human's fix
 var resultLedger = (MEMO_ON && init.resultLedger) ? init.resultLedger : {} // C1: replayable per-call results (empty unless MEMO_ON + contractId matched at init)
 var ledgerDirty = false                              // C1: set when memoAgent stores a new result, cleared on flush
+// L1: verified-pattern-library caches are INTENTIONALLY run-scoped (the durable store is the library at libraryPath, NOT
+// plan.json). retrievalCache de-dups per-item retrieval within a run; bankedThisRun stops re-banking the same item. Nothing
+// here round-trips in plan.json/STATE_INIT, so initPrompt/STATE_INIT are unchanged.
+var retrievalCache = {}                              // L1: itemId -> loaded advisory patterns (this run only)
+var bankedThisRun = new Set()                        // L1: item ids already banked this run (so a re-pass does not re-bank)
 var repoMapHead = init.repoMapHead || null           // git short-sha the current repo map was built at (staleness key)
 var lastRepoMapIteration = init.repoMapIteration || 0
 var repoMapDirty = false                             // set when a re-plan/critique changes the contract -> rebuild next loop entry
@@ -1311,15 +1802,16 @@ var iteration = init.startIteration || 0
 var replanCount = init.replanCount || 0
 var critiqueRounds = init.critiqueRounds || 0
 
-// C2: DURABLE-APPROVAL CONSUMPTION. If TOKEN_ON and the human left a resolution.json whose token matches the
+// C2: DURABLE-APPROVAL CONSUMPTION. If TOKEN_ON||HUMAN_ON and the human left a resolution.json whose token matches the
 // outstanding activeToken persisted at the last halt, apply it onto the in-memory resume levers (approvals / retries /
-// attemptLog / amend) BEFORE the contract-lost check and working-contract determination read them, then consume it once.
-// A token MISMATCH (or no resolution) is ignored -- the run stays halted via the normal gates. Guarded entirely by TOKEN_ON.
-if (TOKEN_ON && init.resolution && init.resolution.token && init.activeToken && init.resolution.token === init.activeToken) {
+// attemptLog / amend, OR the F2 humanSatisfied latch for action "ready") BEFORE the contract-lost check and
+// working-contract determination read them, then consume it once. A token MISMATCH (or no resolution) is ignored -- the
+// run stays halted/suspended via the normal gates. Guarded entirely by TOKEN_ON||HUMAN_ON.
+if ((TOKEN_ON || HUMAN_ON) && init.resolution && init.resolution.token && init.activeToken && init.resolution.token === init.activeToken) {
   const _rr = await applyResolution(init.resolution)
   if (_rr && _rr.status) return _rr            // 'abandon' is terminal (prior run already archived)
   await consumeResolution(init.resolution.token) // delete resolution.json + clear activeToken (best-effort)
-} else if (TOKEN_ON && init.resolution && init.resolution.token && init.activeToken && init.resolution.token !== init.activeToken) {
+} else if ((TOKEN_ON || HUMAN_ON) && init.resolution && init.resolution.token && init.activeToken && init.resolution.token !== init.activeToken) {
   log('resolution token "' + init.resolution.token + '" does not match outstanding "' + init.activeToken + '"; ignoring (staying halted).')
 }
 
@@ -1341,6 +1833,11 @@ var seededFromArgs = false
 if (init.items && init.items.length && !cfg.amendContract) {
   workingItems = init.items                                       // resume: persisted contract wins
   goalText = init.goal || contract.goal || (fileContract && fileContract.goal) || ''
+} else if (fixCfg) {
+  const fc = buildFixContract(fixCfg)                             // CI-FIX: synthesize a one-item contract from the red command
+  workingItems = dedupeById(fc.items)
+  goalText = fc.goal
+  seededFromArgs = true                                           // seeds + persists via the existing seededFromArgs path
 } else if (fileContract && fileContract.items && fileContract.items.length) {
   workingItems = dedupeById(fileContract.items.map(function (it, k) { return normalizeItem(it, (it.priority || k + 1)) }))
   goalText = fileContract.goal || contract.goal || init.goal || ''
@@ -1377,6 +1874,24 @@ if (!workingItems) {
 }
 
 passingCount = passingSet.size
+
+// CI-FIX mode: one-shot BASELINE red-log capture, gated to a FRESH fix run (seeded this invocation, single synthesized
+// item) with an empty ledger. If the command already passes, pre-mark the item passing so the loop converges immediately;
+// otherwise seed attempt #1 with the real failing output as an 'initial-red' ledger entry. Guarded entirely by fixCfg.
+if (fixCfg && seededFromArgs && workingItems.length === 1) {
+  const fitem = workingItems[0]
+  if (!(attemptLog[fitem.id] && attemptLog[fitem.id].length)) {
+    let red = null
+    try { red = await agent(captureRedLogPrompt(fitem), { label: 'ci-fix-redlog', phase: 'Setup', effort: 'low', schema: REDLOG_RESULT }) } catch (e) { red = null }
+    if (red && red.ranRed) {
+      if (red.exitZero) {
+        passingSet.add(fitem.id); passingCount = passingSet.size
+      } else {
+        attemptLog[fitem.id] = [{ iteration: 0, outcome: 'initial-red', reflection: 'BASELINE: the command is currently failing. Its failing output (fix the root cause behind this; do NOT edit the command/harness):\n' + String(red.outputTail || '').slice(0, 1500) }]
+      }
+    }
+  }
+}
 
 phase('Setup')
 
@@ -1476,6 +1991,19 @@ while (true) {
   }
   const item = ready[0] // sequential, dependency-ordered (concurrent execution deferred to worktrees)
 
+  // ---- F2: HUMAN-PRECONDITION SUSPEND (a PLANNED PAUSE, zero compute) ----
+  // This MUST run BEFORE the hard backstops, the scope checkpoint, the build, and ANY counter mutation. The selected item
+  // declares a physical action a PERSON must perform; until the human confirms it (resolution action "ready") for the
+  // current baseline tree, suspend and return. suspendForHuman touches NO retry/fpHistory/iteration/stall/oscillation/
+  // plateau/budget state, so a pause can never trip an anti-spin stop or cost an attempt. Default-OFF: with HUMAN_ON false
+  // and no item declaring humanPrecondition, BOTH conditions are false and this block is inert (byte-for-byte as before).
+  if (HUMAN_ON && humanPrecond(item) && !humanSatisfiedFor(item, baselineTree, humanSatisfied, runId)) {
+    return await suspendForHuman(item)
+  }
+  if (!HUMAN_ON && humanPrecond(item)) {
+    return await escalate('human-gate-disabled', { item: item, note: 'Item "' + item.id + '" declares check.humanPrecondition but the human-gate is OFF. Re-invoke with humanGate:true (or approveToken:true) so goalkeeper can suspend for the physical action instead of running the check on an unprepared setup.' })
+  }
+
   // ---- hard backstops ----
   const tokenOut = budgetExhausted()
   if (iteration >= caps.maxIterations || tokenOut) {
@@ -1518,16 +2046,21 @@ while (true) {
   const N = candidatesFor(item)
 
   // Tail-consumed locals, declared at loop scope so BOTH branches converge to the shared tail (reset/bookkeep/stop):
-  //   outcome, head, hash, reflection, build (build is read for the bookkeeper's builderHead best-partial save).
-  var outcome, head = prevGoodHead, hash = '', reflection = '', build = null
+  //   outcome, head, hash, reflection, build (build is read for the bookkeeper's builderHead best-partial save), and
+  //   focalLatchHit (read by L1 bankPattern at the tail to skip banking a purely-environmental latch pass). Both branches
+  //   ASSIGN focalLatchHit on a verified path; it stays false on blocked/failed rounds where no verify ran.
+  var outcome, head = prevGoodHead, hash = '', reflection = '', build = null, focalLatchHit = false
 
   if (N <= 1) {
     // ======== EXISTING SINGLE-BUILDER PATH (unchanged: same memoAgent('build')/memoAgent('verify'), same logic) ========
     // ---- build (one item; sequential by design) ----
     const priorAttempts = (attemptLog[item.id] || []).slice(-3)
+    // L1: retrieve advisory banked patterns for this item (no-op [] unless LIB_ON). Advisory only -- DELIBERATELY excluded
+    // from buildInput below so it never busts the build memo on resume (the library grows independently of the loop state).
+    const proven = await retrievePatterns(item)
     // C1: structural memo key inputs -- on a crash/resume an identical build situation replays the stored result.
     const buildInput = { goal: goalText, tree: prevGoodHead, check: item.check, description: item.description, expectedOutput: item.expectedOutput, allowTestEdit: item.allowTestEdit, priorAttempts: priorAttempts, attemptNum: (retries[item.id] || 0) }
-    build = await memoAgent('build', item.id, iteration, buildInput, builderPrompt(item, goalText, priorAttempts, (retries[item.id] || 0), caps.maxItemRetries), { label: 'build:' + item.id + '#' + iteration, phase: 'Loop', schema: BUILD_RESULT })
+    build = await memoAgent('build', item.id, iteration, buildInput, builderPrompt(item, goalText, priorAttempts, (retries[item.id] || 0), caps.maxItemRetries, proven), { label: 'build:' + item.id + '#' + iteration, phase: 'Loop', schema: BUILD_RESULT })
 
     // ---- LIVING RE-PLAN: builder discovered the contract is wrong ----
     if (build.replanRequest && build.replanRequest.requested) {
@@ -1557,7 +2090,8 @@ while (true) {
       const curTree = v.artifactHash
       // LATCH (nondeterministic, latch mode): a miss on an item that already passed at THIS exact tree is environmental.
       // (For the focal item this mainly guards resume/partial-state edges, since a passed item is normally not re-selected.)
-      const focalLatchHit = isNondet(item) && passMode(item) === 'latch' && latched[item.id] && latched[item.id] === curTree
+      // Assigned to the loop-scope var (not a fresh const) so the shared tail's bankPattern can read it.
+      focalLatchHit = isNondet(item) && passMode(item) === 'latch' && latched[item.id] && latched[item.id] === curTree
       // Regressions: drop any nondeterministic item (latch OR k-of-n) that already met its check at THIS exact tree -- a
       // later miss at the same code state is environmental, not a real regression.
       const realRegr = (v.regressions || []).filter(function (id) {
@@ -1593,6 +2127,8 @@ while (true) {
     // cherry-pick, and re-verified there (the authority) through the SAME outcome classification as the single path. We lose
     // wall-clock parallelism only. FAIL-SAFE preserved: all-candidates-fail -> null winner -> failed round -> reset -> item-stuck.
     const priorAttempts = (attemptLog[item.id] || []).slice(-3)
+    // L1: retrieve advisory banked patterns ONCE for this item and pass to every candidate builder (no-op [] unless LIB_ON).
+    const proven = await retrievePatterns(item)
     var effN = N
 
     // (a) BUDGET-DEGRADE: never let best-of-N overshoot caps.maxTokens. If a conservative estimate of N more builders'
@@ -1628,7 +2164,7 @@ while (true) {
       // (b.1) build candidate k on the live repo (builder resets to prevGoodHead first). Failure must not throw out of the loop.
       var cb = null
       try {
-        cb = await agent(candidateBuilderPrompt(item, goalText, priorAttempts, (retries[item.id] || 0), caps.maxItemRetries, k, effN, prevGoodHead),
+        cb = await agent(candidateBuilderPrompt(item, goalText, priorAttempts, (retries[item.id] || 0), caps.maxItemRetries, k, effN, prevGoodHead, proven),
           { label: 'build:' + item.id + '#' + iteration + '~cand' + k, phase: 'Loop', schema: CANDIDATE_BUILD_RESULT })
       } catch (e) { cb = null }
 
@@ -1685,7 +2221,8 @@ while (true) {
         const v = await memoAgent('verify', item.id, iteration, verifyInput, verifierPrompt(item, prevGoodHead, Array.from(passingSet), workingItems), { label: 'verify:' + item.id + '#' + iteration + '~main', phase: 'Loop', effort: 'high', schema: VERIFY_RESULT })
         hash = v.artifactHash
         const curTree = v.artifactHash
-        const focalLatchHit = isNondet(item) && passMode(item) === 'latch' && latched[item.id] && latched[item.id] === curTree
+        // Assigned to the loop-scope var (not a fresh const) so the shared tail's bankPattern reads the right value.
+        focalLatchHit = isNondet(item) && passMode(item) === 'latch' && latched[item.id] && latched[item.id] === curTree
         const realRegr = (v.regressions || []).filter(function (id) {
           const it = byId[id]; if (!it) return true
           if (isNondet(it) && latched[id] && latched[id] === curTree) return false
@@ -1724,8 +2261,13 @@ while (true) {
   // Reset to last-good on ANY non-passing round (tree never ratchets backward; head advances only on a pass).
   const doReset = (outcome !== 'passed')
   if (outcome === 'passed') {
+    // L1: capture the diff base for banking = the PRE-PASS last-good head, BEFORE the prevGoodHead=head reassignment below.
+    // (Banking must diff the OLD baseline against the new passing head; using prevGoodHead after the reassignment would diff
+    // head against itself = empty.) Default-OFF: bankPattern is a no-op unless LIB_ON, so this is inert when the library is unset.
+    const bankBase = prevGoodHead
     passingSet.add(item.id); retries[item.id] = 0; prevGoodHead = head
     delete attemptLog[item.id] // item done; drop its failure ledger to keep state small
+    await bankPattern(item, bankBase, head, build, focalLatchHit) // bank the verified solution as a cross-repo pattern (no-op unless LIB_ON)
   } else {
     retries[item.id] = (retries[item.id] || 0) + 1
     const ledger = (attemptLog[item.id] = attemptLog[item.id] || [])
@@ -1738,6 +2280,7 @@ while (true) {
   const bk = await agent(bookkeeperPrompt({
     item: { id: item.id }, outcome: outcome, doRevert: doReset, revertTo: prevGoodHead,
     passing: Array.from(passingSet), attempts: retries, iteration: iteration, latched: latched, attemptLog: attemptLog,
+    humanSatisfied: humanSatisfied, baselineTree: baselineTree, humanOn: HUMAN_ON,
     repoMapHead: repoMapHead, repoMapIteration: lastRepoMapIteration,
     builderHead: (build && build.headSha) ? build.headSha : '',
     prevGoodHead: prevGoodHead, fingerprint: { hash: hash, pass: passingCount, head: effHead }, reflection: reflection,

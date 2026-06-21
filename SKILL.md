@@ -20,7 +20,7 @@ The defining risk this skill addresses is the opposite of laziness. An eager loo
 
 These are described in detail below; the contract is therefore mutable and durable, surviving resume.
 
-**Optional power features (all opt-in, all default-off).** Four newer capabilities are gated behind flags and change nothing unless you turn them on. With no flags set, Goalkeeper behaves exactly as described above. They are: **best-of-N builders** (`caps.candidates` > 1: build N diverse candidate solutions for a hard item and let the deterministic contract pick the winner, no LLM judge); **step memoization** (`memoize: true`: call-granular crash-resume that skips re-running a builder/verifier call whose inputs are unchanged); a **durable approval token** (`approveToken: true`: resolve an escalation by writing a small file instead of re-invoking with args); and a **repo map** (`caps.repoMap`: a cheap, token-bounded file/symbol map written once at setup to ground the planner and builder). Each is detailed in its own section below.
+**Optional power features (all opt-in, all default-off).** Seven newer capabilities are gated behind flags and change nothing unless you turn them on. With no flags set, Goalkeeper behaves exactly as described above. They are: **best-of-N builders** (`caps.candidates` > 1: build N diverse candidate solutions for a hard item and let the deterministic contract pick the winner, no LLM judge); **step memoization** (`memoize: true`: call-granular crash-resume that skips re-running a builder/verifier call whose inputs are unchanged); a **durable approval token** (`approveToken: true`: resolve an escalation by writing a small file instead of re-invoking with args); a **repo map** (`caps.repoMap`: a cheap, token-bounded file/symbol map written once at setup to ground the planner and builder); a **verified pattern library** (`libraryPath`: bank every verifier-passed solution to a cross-repo store and inject the relevant ones as advisory context into future builds); a **durable physical human-in-the-loop gate** (`humanGate: true` + a check's `humanPrecondition`: suspend at zero compute until a person performs a required real-world action, then resume and verify); and a **CI-fix mode** (`fix: { command }`: point Goalkeeper at a red build/test command and it drives that exact command to green). Each is detailed in its own section below.
 
 ## Architecture: three layers
 
@@ -28,11 +28,11 @@ These are described in detail below; the contract is therefore mutable and durab
 
 **2. The spine is durable on-disk state.** Everything that matters persists under `<repo>/.goalkeeper/`, split across **two files** plus a log:
 
-- `plan.json` — **runtime state only**: `status`, the set of `passing` item ids, per-item `attempts` (retry counts), the current `iteration`, `prevGoodHead` (the last known-green git SHA), `fpHistory` (the fingerprint history used for no-progress and oscillation detection), `latched` (the tree-hashes at which a `nondeterministic` check has banked a pass, so a later flaky miss at the same tree does not revert or un-converge the run), and `attemptLog` (the per-item **failure ledger**: each failed attempt's structured "why it failed + what to change", a few most-recent kept per item, re-injected into the next builder attempt). The bookkeeper writes this every round, and the latch and ledger survive resume.
-- `contract.json` — the **durable working contract**: `goal`, `items` (each with its `expectedOutput`, `check`, and `dependsOn`), and the two spent budgets `replanCount` and `critiqueRounds`. This is the contract the loop is *actually* building to right now, which can differ from what you first handed in (the planner may have generated it, self-critique may have appended items, a re-plan may have split items). It is written only by the planner/seed/re-plan/self-critique persist steps; the bookkeeper never touches it.
-- `worklog.md` — an append-only log of per-round reflections.
+- `plan.json`: **runtime state only**: `status`, the set of `passing` item ids, per-item `attempts` (retry counts), the current `iteration`, `prevGoodHead` (the last known-green git SHA), `fpHistory` (the fingerprint history used for no-progress and oscillation detection), `latched` (the tree-hashes at which a `nondeterministic` check has banked a pass, so a later flaky miss at the same tree does not revert or un-converge the run), and `attemptLog` (the per-item **failure ledger**: each failed attempt's structured "why it failed + what to change", a few most-recent kept per item, re-injected into the next builder attempt). The bookkeeper writes this every round, and the latch and ledger survive resume.
+- `contract.json`: the **durable working contract**: `goal`, `items` (each with its `expectedOutput`, `check`, and `dependsOn`), and the two spent budgets `replanCount` and `critiqueRounds`. This is the contract the loop is *actually* building to right now, which can differ from what you first handed in (the planner may have generated it, self-critique may have appended items, a re-plan may have split items). It is written only by the planner/seed/re-plan/self-critique persist steps; the bookkeeper never touches it.
+- `worklog.md`: an append-only log of per-round reflections.
 
-Three further files appear **only when the matching opt-in feature is on**, and are otherwise absent: `results.json` (the memoization ledger, `memoize: true`), `resolution.json` (a human-written durable-token resolution to consume, `approveToken: true`), and `repomap.md` (the generated, git-ignored repo map, `caps.repoMap` other than `'off'`). They are documented under "Optional power features".
+Further files appear **only when the matching opt-in feature is on**, and are otherwise absent: `results.json` (the memoization ledger, `memoize: true`), `resolution.json` (a human-written durable-token resolution to consume, `approveToken: true` *or* `humanGate: true`), `repomap.md` (the generated, git-ignored repo map, `caps.repoMap` other than `'off'`), and `AWAITING-HUMAN.md` (a planned-pause notice written when a check's `humanPrecondition` suspends the run, `humanGate: true`). They are documented under "Optional power features". One piece of durable state lives **outside** `<repo>/.goalkeeper/`: the **verified pattern library** (`libraryPath`) is a cross-repo store at the path you pass, deliberately not under the target repo so a pattern learned in one repo can seed a build in another.
 
 Splitting runtime state from the working contract is deliberate: the bookkeeper rewrites `plan.json` every round, but the contract must not be at risk of a bookkeeping overwrite, so it lives in its own file written only when it genuinely changes.
 
@@ -40,7 +40,7 @@ A **fresh** invocation reads all of these and continues from exactly where the l
 
 If a run that has already made progress finds **no** `contract.json` (lost contract state), it refuses to silently re-seed a possibly-stale caller contract over lost revisions and instead escalates (`contract-lost`): you must re-invoke with `amendContract: true` and the contract, or reset state.
 
-**3. The doorbell is Telegram, best-effort only.** When the loop halts and needs a human, it writes `ESCALATION.md` to disk and *then* tries to ping Telegram. The Telegram ping can fail, be muted, or never arrive. `ESCALATION.md` is the system of record. Never treat "no Telegram message" as "nothing to decide" — check the file.
+**3. The doorbell is Telegram, best-effort only.** When the loop halts and needs a human, it writes `ESCALATION.md` to disk and *then* tries to ping Telegram. The Telegram ping can fail, be muted, or never arrive. `ESCALATION.md` is the system of record. Never treat "no Telegram message" as "nothing to decide". Check the file.
 
 ## How to invoke
 
@@ -72,6 +72,9 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
   },
   memoize: false,                // opt-in: call-granular crash-resume. Builder/verifier calls keyed by an input fingerprint; a completed call returns its stored result from .goalkeeper/results.json instead of re-running
   approveToken: false,           // opt-in: resolve an escalation by writing .goalkeeper/resolution.json {token, action} instead of re-invoking with resume args
+  libraryPath: null,             // opt-in: absolute path to a cross-repo verified-pattern library. Every verifier-passed item is banked there, and patterns relevant to a new item are injected into the builder as advisory context. null = off
+  humanGate: false,              // opt-in: honor a check's humanPrecondition. The run SUSPENDS at zero compute (status awaiting-human, costs no retry/iteration/no-progress) until a person performs the action and writes resolution.json {token, action:"ready"}, then resumes and verifies
+  fix: null,                     // opt-in: CI-fix mode. { command, shell?, cwd?, env?, goal? } -> synthesize a one-item contract whose check is your red command and drive it to green (the captured red output seeds the first build). null = off
   denylist: ["git push","deploy","secrets","external-send"],  // forbidden actions, enforced regardless of mode
   telegram: { chatId: null },    // best-effort doorbell
   approvals: [],                 // leash: e.g. ["start"] to clear the pre-build gate; ["contract-gaps"] to proceed past blocking spec gaps
@@ -92,8 +95,8 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
 
 **Item fields that shape scheduling:**
 
-- `expectedOutput` — the concrete artifact or observable result that proves the item is done. It is what the builder aims to produce; `check` is how the loop measures it.
-- `dependsOn` — an array of item ids that must be passing before this item is eligible. This enables **dependency-ordered scheduling**: the loop only ever picks an item whose dependencies are all green. (Note: dependency-*aware* scheduling is implemented, but **item** execution is still **sequential**, one item per round, in a dependency-respecting order, not in parallel. The opt-in best-of-N builder does run several candidate builders **for a single item**, but they too run **sequentially on the live repo** (one resets to last-good, builds, is verified, then the next), not in parallel worktrees. *Concurrent* execution of **different items** still needs true parallel git worktrees and remains the standing deferral, because the runtime's worktree isolation was found non-viable for an arbitrary target repo.)
+- `expectedOutput`: the concrete artifact or observable result that proves the item is done. It is what the builder aims to produce; `check` is how the loop measures it.
+- `dependsOn`: an array of item ids that must be passing before this item is eligible. This enables **dependency-ordered scheduling**: the loop only ever picks an item whose dependencies are all green. (Note: dependency-*aware* scheduling is implemented, but **item** execution is still **sequential**, one item per round, in a dependency-respecting order, not in parallel. The opt-in best-of-N builder does run several candidate builders **for a single item**, but they too run **sequentially on the live repo** (one resets to last-good, builds, is verified, then the next), not in parallel worktrees. *Concurrent* execution of **different items** still needs true parallel git worktrees and remains the standing deferral, because the runtime's worktree isolation was found non-viable for an arbitrary target repo.)
 
 Write the contract carefully. Goalkeeper is extremely good at converging on whatever you actually wrote, which is exactly why a sloppy contract is dangerous: a perfectly-green run against the wrong checks is worse than a failed run, because it *looks* finished. The spec-review step below exists precisely to catch this before any code is written.
 
@@ -133,9 +136,16 @@ check: { type: "pipeline", build: "make -j", deploy: "make flash",
 
 These capabilities compose: a pipeline check can itself be `nondeterministic` (hardware deploy whose smoke test is flaky) and can pin a `shell`.
 
+**Human-precondition checks (`humanPrecondition` + `humanRearm`, opt-in via `humanGate`).** A check may declare `humanPrecondition`: a real-world action a *person* must perform before the check can pass (for example "move Unit B 50m away and start the listener", or "reseat the SD card"). When `humanGate: true`, the moment the loop reaches such an item it **suspends at zero compute** (status `awaiting-human`); it never tries to perform or fake the action. This pause is **not a failure** (it consumes no retry, iteration, or no-progress budget), and it writes `AWAITING-HUMAN.md` (not `ESCALATION.md`) carrying a one-time token. The person performs the action, writes `.goalkeeper/resolution.json` `{ token, action: "ready" }`, and re-invokes; the run then resumes and verifies the check. The latch is **per-tree** by default (`humanRearm: "per-tree"`: it re-arms, asking again, only when the baseline tree changes), with `"per-run"` (re-ask once per fresh invocation) and `"once"` (never re-ask after the first confirmation) as escape hatches. If a check carries a `humanPrecondition` but `humanGate` is **off**, the run escalates (`human-gate-disabled`) rather than silently skipping the human step. Detailed under "Optional power features".
+
+```js
+check: { type: "command", command: "./scripts/mesh-rx-check.sh", nondeterministic: true,
+         humanPrecondition: "Move Unit B ~50m away, power it on, and start the listener", humanRearm: "per-tree" }
+```
+
 ## Optional power features (opt-in, default-off)
 
-Four capabilities are gated behind flags. **None of them changes the default behavior:** with no flags set (`caps.candidates` 1, `memoize` false, `approveToken` false, `caps.repoMap` `'off'`), Goalkeeper runs exactly as described in the rest of this document. Turn one on only when its trade-off is worth it.
+Seven capabilities are gated behind flags. **None of them changes the default behavior:** with no flags set (`caps.candidates` 1, `memoize` false, `approveToken` false, `caps.repoMap` `'off'`, `libraryPath` null, `humanGate` false, `fix` null), Goalkeeper runs exactly as described in the rest of this document. Turn one on only when its trade-off is worth it.
 
 ### Best-of-N builders (`caps.candidates`, default 1)
 
@@ -187,6 +197,55 @@ On the next invocation Goalkeeper **consumes the token once**, maps the action o
 
 The map is **git-ignored** and is **never a gate**: it only informs the planner and builder, it is not a check and cannot fail a round. It is pure context, bounded in cost by `repoMapTokens`.
 
+### Verified pattern library (`libraryPath`, default off)
+
+`libraryPath` (an absolute path to a directory) turns on a **cross-repo memory of solutions that actually passed**. Every time an item's check passes the independent verifier, Goalkeeper **banks** that solution (the committed diff plus a short summary, keyed by a normalized fingerprint of the item description) into the library. On a later run, **in any repo**, when it starts a new item it **retrieves** the most relevant banked patterns and injects them into the builder as a **"PROVEN PATTERNS" advisory block**.
+
+The point is to stop re-solving the same primitive from scratch. If you brought up an SX1262 radio (TCXO timing, SPI-gating-during-RX) in one firmware repo, that hard-won solution becomes advisory context the next time a similar item comes up in a different board's repo.
+
+**It is advisory, never authoritative.** A retrieved pattern is context handed to the builder, *not* a relaxation of any rule. The independent verifier still runs the real check, the anti-gaming diff inspection still applies, and a pattern that does not fit is ignored. A bad or irrelevant pattern can at worst waste a little builder attention; it can **never** make a wrong solution pass, because nothing about banking or retrieval touches the verifier.
+
+How it works:
+
+- **Bank (on every verified pass).** The committed solution is captured as a diff, **scrubbed of secrets** (the banker strips Authorization headers, `*_KEY` / `*_TOKEN` / `*_SECRET` / `PASSWORD` assignments, and PEM private-key blocks before writing), summarized, and stored keyed by the item description. The source repo is recorded by **basename only** (e.g. `my-firmware`, never an absolute path), so the library does not leak where it came from.
+- **Retrieve (when starting an item).** A low-cost agent ranks the library index against the current item's description and loads the top **`caps.libraryTopK`** (default 3) pattern bodies into the builder prompt. Retrieval is **semantic** (an agent ranks relevance), so a *paraphrased* item still matches a banked solution.
+- **Dedup is deterministic.** Whether a new pass **appends** a fresh pattern, **updates** an existing one, or **replaces a variant** is decided by the script from content fingerprints, not by the agent, so the same library converges the same way regardless of which repo writes to it. Per-problem variants are capped at **`caps.libraryMaxVariantsPerProblem`** (default 3).
+
+The library lives at `libraryPath`, **outside** any target repo's `.goalkeeper/`, and is **never archived or reset** by `freshStart` or by deleting a repo's `.goalkeeper/`. It is shared, durable, cross-repo memory you manage yourself. Degrade-safe: a retrieval or bank failure is non-fatal and never blocks a build (it logs and continues). Configuration: `libraryPath` (the on/off switch), `caps.libraryTopK` (default 3), `caps.libraryPatternMaxChars` (default 1500, the per-pattern body cap), `caps.libraryMaxVariantsPerProblem` (default 3).
+
+### Durable physical human-in-the-loop (`humanGate` + a check's `humanPrecondition`, default off)
+
+Some checks cannot pass until a **person does something physical**: move a radio to the next room, reseat an SD card, power-cycle a board, set up a virgin listener. `humanGate: true` makes Goalkeeper treat those as a **planned suspend**, not a failure.
+
+When the loop reaches an item whose check declares a `humanPrecondition` (see "Check types and capabilities") and `humanGate` is on, it **suspends at zero compute**:
+
+- It returns status **`awaiting-human`**, a distinct state that is **not** an escalation and **not** a halt. It consumes **no** retry, iteration, no-progress, or oscillation budget; a planned pause never costs the run anything.
+- It writes **`AWAITING-HUMAN.md`** (not `ESCALATION.md`) describing the physical action and carrying a one-time **token**, and records `awaitingHuman` + `activeToken` in `plan.json`.
+- It never tries to perform or simulate the action, and it never fakes the check.
+
+The person performs the action, writes **`.goalkeeper/resolution.json`** = `{ "token": "<the token>", "action": "ready" }`, and re-invokes Goalkeeper. The run consumes the token once, **latches** the human-satisfaction for that item (recording the authorizing token, so `plan.json` is auditable against `AWAITING-HUMAN.md`), and proceeds straight to building and verifying it. By default the latch is **per-tree** (`humanRearm`): it re-arms, asking again, only when the baseline tree changes, so the person is not re-asked every round; `"per-run"` and `"once"` adjust that.
+
+This shares the resolution-file machinery of the durable approval token, so turning on **`approveToken`** *also* enables `humanPrecondition` handling. If a check carries a `humanPrecondition` but **neither** `humanGate` nor `approveToken` is on, the run **escalates** (`human-gate-disabled`) instead of silently skipping the human step. A physical gate you declared but did not enable is an error, not something to ignore. This is what lets Goalkeeper drive a hardware-in-the-loop task that genuinely needs a person between rounds without burning its anti-spin budget on the wait.
+
+### CI-fix mode (`fix`, default off)
+
+`fix` points Goalkeeper at a **single red command** (a failing build, a failing test suite, a failing lint) and drives *that exact command* to green. Instead of writing a contract, you hand it a command:
+
+```js
+fix: {
+  command: "npm test -- auth.spec",   // the red command to drive to exit 0
+  shell: "pwsh", cwd: "packages/api", env: { NODE_ENV: "test" },  // optional, same semantics as a check
+  goal: "Fix the failing auth tests"   // optional human-readable goal label
+}
+```
+
+Goalkeeper **synthesizes a one-item contract** whose single check *is* your command (marked `nondeterministic` with a latch policy, so a flaky environment is not read as a code failure), then runs the normal build/verify loop against it. Two specifics:
+
+- **The red output seeds the first build.** Before the first attempt, Goalkeeper runs your command once to **capture the failing output** and feeds it to the builder as the initial signal of what to fix (recorded as an `initial-red` entry in the item's failure ledger), so the builder starts from the actual error, not a blank slate.
+- **It cannot game the harness.** The synthesized item forbids editing, stubbing, or weakening the command itself; the only way to converge is to fix the underlying code so the real command passes. The anti-gaming verifier applies as always.
+
+CI-fix mode composes with the other features: it is just a contract the engine generated for you, so `libraryPath`, best-of-N, memoization, and the rest all apply. Re-invoking with the same `fix` **resumes** the in-progress run (the synthesized contract has a stable identity), so a fix that needs several rounds picks up where it left off rather than starting over.
+
 ## The workflow phases
 
 A run moves through five phases: **Plan -> Setup -> Loop -> Review -> Escalate**.
@@ -209,7 +268,7 @@ If you pass `{ goal }` with no `items[]`, a **PLANNER** agent decomposes the goa
 
 4. **Living re-plan (only if the builder asks).** If the builder discovers the **contract itself** is wrong (the item needs an unlisted prerequisite, or should be split), it returns a `replanRequest` and the loop revises the working contract (adding and/or splitting items), persists it, and re-evaluates. This is capped by `maxReplans` (default 2); exceeding it escalates (`replan-budget`). It is for plan-is-wrong situations only, not for dodging a hard item.
 
-5. **Verify (authoritative).** An independent verifier — which does **not** trust the builder's report, *or the check's green result* — runs the item's check *and* the full suite, plus a regression re-run of every already-passing item. It reports: regressions, any tampering with protected check files, the resulting git HEAD sha, a tree-id artifact hash, and whether the working tree is clean (a pass with uncommitted source changes is *not* a durable pass). It also returns a concise `failureAnalysis` (why the item failed + what to change) used as that round's failure reflection. This verifier, not the builder, decides whether the item passed. For a `nondeterministic` check it applies the item's `passPolicy` (retry up to `n`, running any `precondition` first, pass on latch or k-of-n) and **latches the tree-hash** on success; a `pipeline` check runs build-then-deploy-then-verify with the build-fail short-circuit; checks declaring a `shell`/`cwd`/`env` run through exactly that shell and environment.
+5. **Verify (authoritative).** An independent verifier, which does **not** trust the builder's report, *or the check's green result*, runs the item's check *and* the full suite, plus a regression re-run of every already-passing item. It reports: regressions, any tampering with protected check files, the resulting git HEAD sha, a tree-id artifact hash, and whether the working tree is clean (a pass with uncommitted source changes is *not* a durable pass). It also returns a concise `failureAnalysis` (why the item failed + what to change) used as that round's failure reflection. This verifier, not the builder, decides whether the item passed. For a `nondeterministic` check it applies the item's `passPolicy` (retry up to `n`, running any `precondition` first, pass on latch or k-of-n) and **latches the tree-hash** on success; a `pipeline` check runs build-then-deploy-then-verify with the build-fail short-circuit; checks declaring a `shell`/`cwd`/`env` run through exactly that shell and environment.
 
    **Anti-gaming.** Beyond running the check, the verifier *inspects the builder's diff* and asks whether the check passed only because it was **gamed**: hardcoding the exact expected output, special-casing the check's specific inputs, stubbing a constant return, a no-op / `exit 0` / trivial pass, deleting or weakening assertions, or writing the check's expected sentinel without doing the real work. If so it sets `suspectedGaming`, and the engine treats that round as a **failed** round (the new `revert-gaming` outcome) instead of a pass: the round is reverted, it counts against the item's retry budget, and a gamed solution therefore can **never** converge. (A genuinely-wrong item still escalates normally via item-stuck.) Items with `allowTestEdit: true`, which author their own check, are **exempt** from the gaming revert.
 
@@ -221,7 +280,7 @@ When every item passes, an independent **final** full-suite check runs (`final-s
 
 - A **blocking** weakness with a concrete suggested check re-opens the loop as a capped remediation item (the critique budget is `maxCritiqueRounds`, default 1, so this cannot loop forever). In leash mode it escalates (`self-critique`) instead of silently adding work.
 - If the critic is *not* satisfied but offers no actionable item, the run escalates (`self-critique-unactionable`) rather than laundering an unresolved concern into a false "converged".
-- If the critic is satisfied, the run **converges** — but a converged result can still carry a `weaknesses[]` array and a `selfCritiqueSummary` of **minor** limitations it flagged but did not block on. So a "converged" result may ship with explicitly-flagged limitations; read them.
+- If the critic is satisfied, the run **converges**, but a converged result can still carry a `weaknesses[]` array and a `selfCritiqueSummary` of **minor** limitations it flagged but did not block on. So a "converged" result may ship with explicitly-flagged limitations; read them.
 - If the critique budget is already spent, the run converges without another pass.
 
 The **engine**, not the final-verify agent, is the authority that stamps `status: "converged"` (a focused, retried step decoupled from the cosmetic `REPORT.md`), so a nondeterministic latch-converge and a self-critique re-open can never leave a wrong or premature converged status. The converged result object gains a `statusStamped` boolean recording that the stamp was applied.
@@ -260,36 +319,39 @@ Under pressure to make a check pass, an unconstrained agent will cheat. These gu
 
 Any non-converged stop writes **`ESCALATION.md`** to `<repo>/.goalkeeper/` and then pings Telegram if reachable. The full set of escalation reasons:
 
-- **`item-stuck`** — one item failed its check 3 times. The escalation points at `.goalkeeper/last-attempt-<itemId>.patch`, the diff of the final discarded attempt (which may be empty if it changed nothing).
-- **`no-progress`** — 3 consecutive rounds with no new pass and no HEAD advance.
-- **`oscillation`** — the loop returned to a recently-seen tree-state without progress.
+- **`item-stuck`**: one item failed its check 3 times. The escalation points at `.goalkeeper/last-attempt-<itemId>.patch`, the diff of the final discarded attempt (which may be empty if it changed nothing).
+- **`no-progress`**: 3 consecutive rounds with no new pass and no HEAD advance.
+- **`oscillation`**: the loop returned to a recently-seen tree-state without progress.
 - **`plateau`**: the passing-count did not increase for `maxPlateau` rounds (default 8); a best-of-N backstop for when HEAD advances but no new item passes.
-- **`budget-exhausted`** — `maxIterations`, the per-run token budget, or the shared session turn budget ran out; a `budgetKind` field (`"iteration"` / `"token"` / `"session"`) names which, and the per-run tokens spent and resume advice are tailored to it (a `"session"` halt needs a fresh turn, not a higher `maxTokens`). It points at `.goalkeeper/last-attempt-<itemId>.patch` for the in-flight item's discarded work.
-- **`final-suite-failed`** — all items passed individually but the final full-suite check did not.
-- **`contract-incomplete`** — the spec-review found blocking gaps in the contract.
-- **`dependency-deadlock`** — items remain but none are eligible (a `dependsOn` is unsatisfiable / points at a missing id).
-- **`scope-checkpoint`** — the periodic scope check recommended stopping or asking the human.
-- **`replan`** — (leash only) a living re-plan revised the contract and paused for your review.
-- **`replan-budget`** — a builder requested another re-plan past `maxReplans`.
-- **`self-critique`** — (leash only) the self-critique gate opened remediation items and paused.
-- **`self-critique-unactionable`** — the critic is unsatisfied but produced no actionable remediation item.
-- **`planning-failed`** — the planner could not produce a usable contract from the goal.
-- **`contract-lost`** — a started run found no `contract.json`; re-invoke with `amendContract` or reset.
+- **`budget-exhausted`**: `maxIterations`, the per-run token budget, or the shared session turn budget ran out; a `budgetKind` field (`"iteration"` / `"token"` / `"session"`) names which, and the per-run tokens spent and resume advice are tailored to it (a `"session"` halt needs a fresh turn, not a higher `maxTokens`). It points at `.goalkeeper/last-attempt-<itemId>.patch` for the in-flight item's discarded work.
+- **`final-suite-failed`**: all items passed individually but the final full-suite check did not.
+- **`contract-incomplete`**: the spec-review found blocking gaps in the contract.
+- **`dependency-deadlock`**: items remain but none are eligible (a `dependsOn` is unsatisfiable / points at a missing id).
+- **`scope-checkpoint`**: the periodic scope check recommended stopping or asking the human.
+- **`replan`**: (leash only) a living re-plan revised the contract and paused for your review.
+- **`replan-budget`**: a builder requested another re-plan past `maxReplans`.
+- **`self-critique`**: (leash only) the self-critique gate opened remediation items and paused.
+- **`self-critique-unactionable`**: the critic is unsatisfied but produced no actionable remediation item.
+- **`planning-failed`**: the planner could not produce a usable contract from the goal.
+- **`contract-lost`**: a started run found no `contract.json`; re-invoke with `amendContract` or reset.
 - **`contract-mismatch`**: an in-progress (or halted) run exists but this invocation passed a *different* contract (different goal or different item ids). The run halts and asks you to choose rather than silently resuming the wrong work.
 - **`contractPath-unreadable`**: `contractPath` was set but the file could not be read as JSON. The run fails fast instead of silently falling back to another contract source.
-- **`persist-failed`** — the working contract could not be written to disk (a fatal durability failure).
+- **`human-gate-disabled`**: a check declares a `humanPrecondition` but neither `humanGate` nor `approveToken` is enabled, so the required physical step cannot be honored. Enable `humanGate: true` (see "Optional power features") and re-invoke.
+- **`persist-failed`**: the working contract could not be written to disk (a fatal durability failure).
+
+**`awaiting-human` is not in this set.** When `humanGate` (or `approveToken`) is on and a check's `humanPrecondition` is reached, the run **suspends** (status `awaiting-human`) rather than escalating: it writes `AWAITING-HUMAN.md` (a planned-pause notice carrying a resolution token), not `ESCALATION.md`, and consumes no anti-spin budget. Resolve it by performing the action, writing `resolution.json { token, action: "ready" }`, and re-invoking (see "Optional power features").
 
 `ESCALATION.md` contains: the goal restated; progress so far; the specific blocking item; the actual failing check output; what was already tried (drawn from the item's `attemptLog` failure ledger and the worklog); a pointer to `last-attempt-<itemId>.patch` for the discarded work where one was saved (item-stuck and budget-exhausted); the decision needed; **five one-tap options** (skip / relax / hint / **revise the contract** / abort); and exact resume instructions.
 
 **To resume:** re-invoke goalkeeper (it reads `plan.json` + `contract.json` and picks up where it stopped), or first amend the contract and then re-invoke:
 
-- Relax a check, add a hint, or drop an item, then re-invoke — the persisted contract wins on resume by default.
+- Relax a check, add a hint, or drop an item, then re-invoke. The persisted contract wins on resume by default.
 - To **replace** the contract wholesale, pass `amendContract: true` with the new `contract.items[]`; that overrides the persisted contract.
 - To give a stuck item a fresh retry budget on a human-amended resume (e.g. after relaxing its check), pass `resetAttempts: ["<item-id>"]`, which clears that item's retry count, resets the stall counter, **and clears its `attemptLog` failure ledger** so old "do not repeat" guidance cannot contradict your fix.
 
 Because all state is on disk, resuming is just running the skill again against the same repo.
 
-**Resolving via a durable token (opt-in, `approveToken: true`).** If you turned on the durable approval token, you have a second way to resolve a halt that does not require re-invoking with resume args. Each escalation mints a deterministic **token** (printed in `ESCALATION.md`); write **`.goalkeeper/resolution.json`** = `{ token, action }` where `action` is one of `approve` | `redirect` | `abandon` | `hint` (with optional `hint` text or `amendItems`). On the next invocation Goalkeeper consumes that token **once** and maps the action onto the same resume levers above (`approve` -> approvals, `redirect` -> `amendContract`/`amendItems`, `resetAttempts` where relevant, `hint` -> a Reflexion hint). A token that does **not** match the active halt is ignored and the run stays halted, so a stale resolution file cannot release the wrong escalation.
+**Resolving via a durable token (opt-in, `approveToken: true`).** If you turned on the durable approval token, you have a second way to resolve a halt that does not require re-invoking with resume args. Each escalation mints a deterministic **token** (printed in `ESCALATION.md`); write **`.goalkeeper/resolution.json`** = `{ token, action }` where `action` is one of `approve` | `redirect` | `abandon` | `hint` | `ready` (with optional `hint` text or `amendItems`). On the next invocation Goalkeeper consumes that token **once** and maps the action onto the same resume levers above (`approve` -> approvals, `redirect` -> `amendContract`/`amendItems`, `resetAttempts` where relevant, `hint` -> a Reflexion hint, `ready` -> latch a suspended `awaiting-human` item's `humanPrecondition` so it proceeds to verify). A token that does **not** match the active halt is ignored and the run stays halted, so a stale resolution file cannot release the wrong escalation.
 
 ## Close-out on success
 
@@ -307,7 +369,7 @@ Convergence has its own on-disk artifact, the success analog of `ESCALATION.md`.
 - **Replace** the contract in place: pass `amendContract: true`.
 - **Abandon** the old run and start the new task: pass `freshStart: true` (archives the old run), or delete the state dir.
 
-This extends the existing close-out behavior — which already archived a **converged** prior run on new work — to **halted** ones, so neither a finished nor an unfinished prior run can be silently overwritten by a different task.
+This extends the existing close-out behavior, which already archived a **converged** prior run on new work, to **halted** ones, so neither a finished nor an unfinished prior run can be silently overwritten by a different task.
 
 **`contractPath` fails fast.** If `contractPath` is set but the file cannot be read as JSON, the run now fails with `contractPath-unreadable` instead of silently falling back to inline `contract.items` or the planner. A contract you pointed at but Goalkeeper could not load is an error, not a reason to guess.
 
@@ -317,7 +379,7 @@ This extends the existing close-out behavior — which already archived a **conv
 
 - **envelope (default).** Runs unattended. It halts only on the hard triggers above (a blocking spec gap, a stuck item, no-progress, oscillation, budget, a dependency deadlock, a scope-check recommending a stop, an unactionable self-critique, or a re-plan past budget). Re-planning and minor self-critique remediation happen *automatically* in this mode, within their caps. This is the "go do it, and bother me only if you're genuinely blocked" mode.
 
-- **leash.** Pauses at a pre-build approval gate and again after every `runRounds` rounds. You re-invoke to continue, passing `approvals: ["start"]` to clear that first pre-build gate (and `approvals: ["contract-gaps"]` to proceed past a spec-review that flagged blocking gaps). In leash mode the contract-mutating gates also pause for your review instead of acting silently: a living re-plan escalates as `replan`, and the self-critique gate opening remediation items escalates as `self-critique`. Because state is durable, **leash is simply envelope run in smaller batches** — same machinery, same on-disk spine, you are just choosing to look in between.
+- **leash.** Pauses at a pre-build approval gate and again after every `runRounds` rounds. You re-invoke to continue, passing `approvals: ["start"]` to clear that first pre-build gate (and `approvals: ["contract-gaps"]` to proceed past a spec-review that flagged blocking gaps). In leash mode the contract-mutating gates also pause for your review instead of acting silently: a living re-plan escalates as `replan`, and the self-critique gate opening remediation items escalates as `self-critique`. Because state is durable, **leash is simply envelope run in smaller batches**: same machinery, same on-disk spine, you are just choosing to look in between.
 
 ## When to use / when not
 
@@ -331,7 +393,7 @@ This extends the existing close-out behavior — which already archived a **conv
 
 - one-shot edits (just make the edit)
 - work that needs fresh human design judgment at each step
-- anything that lacks a verifiable "done" signal — Goalkeeper's whole value is the external check, and without one it has nothing to converge on.
+- anything that lacks a verifiable "done" signal: Goalkeeper's whole value is the external check, and without one it has nothing to converge on.
 
 ## Limitations (honest deviations)
 
@@ -347,9 +409,9 @@ Three things are deferred, all sharing the same safety property (a bad round can
 
 ## Hard denylist and kill switch
 
-**Denylist.** The forbidden actions — `git push`, `deploy`, `secrets`, `external-send` — are enforced in **both** autonomy modes, regardless of `mode` or `autonomy`. Goalkeeper operates inside the repo and does not reach outside it.
+**Denylist.** The forbidden actions (`git push`, `deploy`, `secrets`, `external-send`) are enforced in **both** autonomy modes, regardless of `mode` or `autonomy`. Goalkeeper operates inside the repo and does not reach outside it.
 
-**Kill switch.** To stop a run, **stop the Workflow** from `/workflows`. To reset Goalkeeper's state entirely, **delete the `.goalkeeper/` directory** (under `<repo>/`). That clears *both* state files, `plan.json` (runtime, including the `attemptLog` failure ledger) and `contract.json` (working contract), plus `worklog.md`, any `ESCALATION.md` or `REPORT.md`, any `last-attempt-<itemId>.patch` snapshots of discarded attempts, the opt-in `results.json` (memoization ledger), `resolution.json` (a pending durable-token resolution), and `repomap.md` (the generated repo map), and the `archive/` of past converged runs. The next invocation then starts fresh from the contract you pass in (or re-plans from the goal). You rarely need to do this by hand: a **converged** run self-documents via `REPORT.md` and auto-archives when you give it a new task, and `freshStart: true` archives any leftover state for you. Deleting the directory remains the blunt full reset.
+**Kill switch.** To stop a run, **stop the Workflow** from `/workflows`. To reset Goalkeeper's state entirely, **delete the `.goalkeeper/` directory** (under `<repo>/`). That clears *both* state files, `plan.json` (runtime, including the `attemptLog` failure ledger) and `contract.json` (working contract), plus `worklog.md`, any `ESCALATION.md` or `REPORT.md`, any `last-attempt-<itemId>.patch` snapshots of discarded attempts, the opt-in `results.json` (memoization ledger), `resolution.json` (a pending durable-token resolution), `AWAITING-HUMAN.md` (a pending human-precondition pause notice), and `repomap.md` (the generated repo map), and the `archive/` of past converged runs. (The verified pattern library at `libraryPath` lives **outside** `.goalkeeper/` and is **not** touched by this reset.) The next invocation then starts fresh from the contract you pass in (or re-plans from the goal). You rarely need to do this by hand: a **converged** run self-documents via `REPORT.md` and auto-archives when you give it a new task, and `freshStart: true` archives any leftover state for you. Deleting the directory remains the blunt full reset.
 
 ## Example invocation
 
@@ -384,7 +446,7 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
 }})
 ```
 
-**Goal only** — let the planner build the contract:
+**Goal only**: let the planner build the contract:
 
 ```js
 Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
@@ -397,4 +459,4 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
 }})
 ```
 
-Both run unattended: Goalkeeper plans the contract if you gave only a goal, reviews it, builds one item per round (in dependency order) to its check, verifies each independently against the full suite, runs an adversarial self-critique once everything is green, and either converges (all items green, a clean final suite run, no blocking weakness — possibly with minor caveats flagged) or halts and writes `ESCALATION.md` for you to decide.
+Both run unattended: Goalkeeper plans the contract if you gave only a goal, reviews it, builds one item per round (in dependency order) to its check, verifies each independently against the full suite, runs an adversarial self-critique once everything is green, and either converges (all items green, a clean final suite run, no blocking weakness, possibly with minor caveats flagged) or halts and writes `ESCALATION.md` for you to decide.
