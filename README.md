@@ -49,6 +49,44 @@ Four extra capabilities are gated behind flags and **change nothing unless you t
 - **Durable approval token** (`approveToken: true`, default false). Instead of resolving an escalation by re-invoking with args, each escalation mints a deterministic token (shown in `ESCALATION.md`); a human writes `.goalkeeper/resolution.json` = `{ token, action }` (`action` is `approve` | `redirect` | `abandon` | `hint`) and the next invocation consumes it once, mapping it onto the existing resume levers. A token that does not match the active halt is ignored.
 - **Repo map** (`caps.repoMap`, default `'off'`). A cheap agent writes a token-bounded `.goalkeeper/repomap.md` (ranked key files in `'tree'` mode, plus top-level symbols via a ctags → git-grep → tree fallback in `'symbols'` mode; budget `caps.repoMapTokens`, default 1500) once at setup (refreshed after a re-plan/self-critique, or every `caps.repoMapRefreshEvery` rounds if > 0), and the planner and builder read it for grounding. It is git-ignored and never a gate.
 
+### Turning the opt-in features on
+
+All four are off by default. Set the flag in the `args` you pass to the workflow (or just ask Claude, e.g. *"use goalkeeper on this repo with best-of-3 builders and the repo map on"*).
+
+**Best-of-N builders** (try several approaches to a hard item, keep the one the contract accepts):
+```js
+caps: { candidates: 3 }                               // up to 3 candidates; by default only RETRIES fan out
+// caps: { candidates: 3, candidatesHardOnly: false }  // fan out from the first try too
+// per item:  { id: "gnarly-item", candidates: 4, check: { ... } }   // force best-of-N for one item only
+```
+
+**Step memoization** (make crash/resume cheap by skipping unchanged builder/verifier calls):
+```js
+memoize: true                                         // writes .goalkeeper/results.json; safe to delete (it just recomputes)
+```
+
+**Repo map** (give the planner and builder a token-bounded map of the codebase):
+```js
+caps: { repoMap: "symbols" }                          // 'tree' = file tree only | 'symbols' = ctags->grep->tree; budget caps.repoMapTokens
+```
+
+**Durable approval token** (resolve an escalation by dropping a file instead of re-invoking with args):
+```js
+approveToken: true
+```
+When a run halts, `ESCALATION.md` (and `plan.json`'s `activeToken`) carry a token such as `gk-a1b2c3-item-stuck-d4e5f6`. To unblock it, write `<repo>/.goalkeeper/resolution.json` and re-invoke goalkeeper with no new contract:
+```json
+{ "token": "gk-a1b2c3-item-stuck-d4e5f6", "action": "hint",
+  "hint": "the refill must use the injected clock, not Date.now()" }
+```
+`action` is one of:
+- `approve`: give the blocking item a fresh attempt budget and continue.
+- `hint`: same, plus inject `hint` into the builder's memory (the Reflexion ledger) so the next attempt sees it.
+- `redirect`: replace the contract by adding `"amendItems": [ { id, description, check, ... } ]` (and optional `"amendGoal"`).
+- `abandon`: archive the run and stop.
+
+The token is **consumed once** (the file is deleted and `activeToken` cleared on resume); a token that does not match the current halt is ignored, so a stale resolution can never fire on the wrong run.
+
 ---
 
 ## Requirements
@@ -196,7 +234,7 @@ When a run converges it writes a completion report to `<repo>/.goalkeeper/REPORT
 
 Three things are deferred, all sharing the same safety property (a bad round can never corrupt good work):
 
-1. **Concurrent execution is deferred.** Scheduling is dependency-*aware* (items run in dependency order), but execution is **sequential**, one item per round. Running independent items in parallel needs per-round git worktrees.
+1. **Concurrent execution is deferred.** Scheduling is dependency-*aware* (items run in dependency order), but execution is **sequential**, one item per round (best-of-N, when enabled, also runs its N candidates for a single item sequentially). Running *different* items in parallel would need isolated worktrees, which the runtime does not provide for an arbitrary target repo.
 2. **No per-round git worktree yet.** The loop uses snapshot-HEAD plus reset-on-fail on the live repo.
 3. **The wall-clock cap is soft.** The hard backstops are the iteration count and the token budget.
 
