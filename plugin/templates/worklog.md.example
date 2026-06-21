@@ -1,7 +1,7 @@
 # Goalkeeper worklog (append-only)
 
 Format: `round | item-id | outcome | why`
-Outcomes: passed | failed | blocked | revert-tamper | revert-regression
+Outcomes: passed | failed | blocked | revert-tamper | revert-regression | revert-gaming
 This is loop memory. Read it before retrying an item so you never repeat a dead approach.
 
 1 | middleware-exists | passed | Created src/middleware/rateLimit.js exporting a token-bucket factory (capacity + refill rate). file_exists check green first try.

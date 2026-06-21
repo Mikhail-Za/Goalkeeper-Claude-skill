@@ -12,7 +12,7 @@ Most "agent in a loop" setups share the same failure mode: nothing in the loop e
 
 - **"Done" is always an external check passing,** never the builder agent's self-report. A separate verifier runs the checks.
 - **The loop cannot spin forever.** Item-stuck (3 retries), no-progress, oscillation, and a hard iteration/token budget are all evaluated in code at the end of every round.
-- **It cannot cheat.** The builder may not edit its own check files; any round that regresses a previously-green check is reset.
+- **It cannot cheat.** The builder may not edit its own check files; any round that regresses a previously-green check is reset; and the verifier inspects the diff so a check that passes only by being *gamed* (hardcoded output, stubbed return, gutted assertions, a no-op pass) is scored as a failed round, not a win.
 - **When it gets stuck, it tells you.** It writes a structured `ESCALATION.md` to disk (and optionally pings Telegram) with the blocking item, what was tried, and one-tap options to unblock it.
 
 It also has a planning and self-correction layer built in (a "fable-mode" workflow): give it just a goal and it plans the contract; once everything is green it runs an adversarial self-critique to catch what the checks missed; it periodically asks whether finishing is still worth it; and a builder that discovers the plan is wrong can request the contract be revised mid-run. Every one of those loop-extending features is capped so the skill that prevents infinite loops does not grow one.
@@ -24,9 +24,10 @@ It also has a planning and self-correction layer built in (a "fable-mode" workfl
 | Feature | What it does |
 | --- | --- |
 | **Deterministic stop conditions** | item-stuck (3 retries), no-progress, oscillation, and a budget backstop are enforced in code, not prompts. A "ran out of budget" state is kept distinct from "converged". |
-| **Contract-is-the-product spec review** | Before any code is written, an adversarial critic attacks the contract for gaps and ambiguity, because a perfectly-green run against the wrong checks is worse than a failed one. |
-| **Independent verifier** | A separate agent, which does not trust the builder, runs each item's check plus the full suite and a regression re-run of every passing item. |
-| **Anti-destruction guards** | Write-protected check files, a no-placeholder rule, and reset-to-last-good on any non-passing round. The working tree never ratchets backward into a broken state. |
+| **Contract-is-the-product spec review** | Before any code is written, an adversarial critic attacks the contract for gaps and ambiguity, because a perfectly-green run against the wrong checks is worse than a failed one. It also **distrusts the check itself**: a check that is wrong (passes buggy code or fails correct code) or cheat-able is a blocking gap, and it prefers mechanical pass/fail checks over subjective rubrics. |
+| **Independent + anti-gaming verifier** | A separate agent, which does not trust the builder, runs each item's check plus the full suite and a regression re-run of every passing item. It also inspects the builder's diff and, if the check passed only by **gaming** it (hardcoded output, stubbed return, gutted assertions, no-op pass), fails the round (`revert-gaming`) so a gamed item can never converge. |
+| **Anti-destruction guards** | Write-protected check files, a no-placeholder rule, the anti-gaming revert, and reset-to-last-good on any non-passing round. The working tree never ratchets backward into a broken state. The discarded diff of each failed round is saved to `last-attempt-<item>.patch` so you can still inspect reverted work. |
+| **Reflexion failure ledger** | Each failed attempt's "why it failed + what to change" is persisted per item (`attemptLog`) and re-injected into the next builder attempt with a "do not repeat these" instruction; the last retry before escalation demands a fundamentally different approach or a blocked declaration. |
 | **Durable on-disk state** | Two state files under the target repo survive crashes, `/clear`, dropped channels, and reboots. A fresh invocation resumes exactly where the last one stopped. |
 | **Human escalation** | Any non-converged stop writes a structured `ESCALATION.md` (system of record) and best-effort pings Telegram (a doorbell, never the record). |
 | **Planning front-end** | Hand it a bare goal and a planner decomposes it into an ordered contract with expected outputs, checks, and dependencies. |
@@ -145,11 +146,11 @@ A run moves through five phases: **Plan → Setup → Loop → Review → Escala
 
 1. **Plan** (only if you passed a bare goal): a planner decomposes the goal into atomic, independently-checkable items.
 2. **Setup**: an adversarial spec-review attacks the contract for gaps before a line is built.
-3. **Loop** (one item per round): pick the highest-priority item whose dependencies are green, optionally run a scope checkpoint, build it, optionally revise the contract if the builder finds the plan is wrong, verify it independently against the full suite, then persist state and revert the round if it regressed anything.
+3. **Loop** (one item per round): pick the highest-priority item whose dependencies are green, optionally run a scope checkpoint, build it (with its own prior failures from the `attemptLog` ledger re-injected so it does not repeat them), optionally revise the contract if the builder finds the plan is wrong, verify it independently against the full suite (including an anti-gaming diff inspection), then persist state and revert the round if it regressed anything or gamed the check (saving the discarded diff to `last-attempt-<item>.patch` first).
 4. **Review**: when every item passes, run a final full-suite check and an adversarial self-critique. A blocking weakness re-opens the loop (capped); otherwise it converges, possibly flagging minor caveats.
 5. **Escalate**: any non-converged stop writes `ESCALATION.md` and pings Telegram if reachable.
 
-State lives in two files under `<repo>/.goalkeeper/`: `plan.json` (runtime: passing items, attempts, fingerprint history) and `contract.json` (the durable working contract). They are separated deliberately so the per-round bookkeeper can never clobber the contract. Both are git-excluded automatically.
+State lives in two files under `<repo>/.goalkeeper/`: `plan.json` (runtime: passing items, attempts, fingerprint history, and the per-item `attemptLog` failure ledger) and `contract.json` (the durable working contract). They are separated deliberately so the per-round bookkeeper can never clobber the contract. Both are git-excluded automatically.
 
 ### Non-deterministic / hardware-in-the-loop checks
 

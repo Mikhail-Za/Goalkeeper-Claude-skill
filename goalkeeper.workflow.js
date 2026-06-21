@@ -47,6 +47,15 @@
  *   - PIPELINE checks: {type:"pipeline", build, deploy, verify, freshBuild?} short-circuit to FAIL on a build error
  *     BEFORE deploy, so a stale/failed artifact can never masquerade as a passing or regressing deploy.
  *   - RESUME identity: a halted run only auto-resumes for the SAME contract; a different contract halts asking the human.
+ *
+ * INTEGRITY + MEMORY HARDENING
+ *   - ANTI-GAMING: the verifier inspects the builder's diff and rejects a "pass" that only games the check (hardcoded
+ *     output, stub, no-op/exit-0, sentinel-without-work); the spec-review distrusts the check ITSELF (a wrong or gameable
+ *     check is a blocking gap; mechanical-over-subjective).
+ *   - FAILURE LEDGER: each failed attempt's why-it-failed + what-to-change is persisted per item (plan.json attemptLog)
+ *     and re-injected into the next builder attempt (Reflexion); the last retry before item-stuck demands a different approach.
+ *   - BEST-PARTIAL: a failed attempt's diff is saved as .goalkeeper/last-attempt-<id>.patch before the reset, so the
+ *     discarded work stays inspectable; the best-good tree remains committed at prevGoodHead.
  */
 
 export const meta = {
@@ -142,6 +151,7 @@ const STATE_INIT = {
     critiqueRounds: { type: 'number' },
     status: { type: 'string' },
     latched: { type: 'object' },
+    attemptLog: { type: 'object' },
     fileContract: { type: 'object', properties: { goal: { type: 'string' }, items: { type: 'array', items: ITEM_SHAPE } } },
     workingTreeDirty: { type: 'boolean' },
     notes: { type: 'string' },
@@ -186,6 +196,9 @@ const VERIFY_RESULT = {
     workingTreeClean: { type: 'boolean' },
     checkOutputTail: { type: 'string' },
     summary: { type: 'string' },
+    suspectedGaming: { type: 'boolean' },
+    gamingReason: { type: 'string' },
+    failureAnalysis: { type: 'string' },
   },
   required: ['itemPassed', 'fullSuitePassed', 'checksTampered', 'headSha', 'artifactHash'],
 }
@@ -389,6 +402,14 @@ function specReviewPrompt (goalText, items) {
     'because the loop would treat an environmental miss as a real code failure. BUILD/DEPLOY: a check that builds then',
     'deploys/measures should short-circuit on build failure (a {type:"pipeline"} check does); flag any deploy/measure',
     'check that could act on a stale artifact after a failed or no-op build.',
+    'DISTRUST THE CHECK ITSELF (a check can be WRONG or GAMEABLE, not just incomplete): for each check ask (a) is it',
+    'CORRECT -- does it actually test the goal, with no inverted/trivial/always-true assertion that would pass buggy code',
+    'or fail correct code? and (b) is it CHEAT-RESISTANT -- would a trivial cheat pass it (hardcoding the exact expected',
+    'output, special-casing the check\'s specific inputs, stubbing a constant return, exit 0/no-op, writing an expected',
+    'sentinel without doing the work)? A check a cheat can pass is a BLOCKING gap; it must exercise behavior a cheat cannot',
+    'fake (multiple/edge inputs, properties, round-trips, real error paths). MECHANICAL-ONLY: prefer objective pass/fail or',
+    'numeric checks; a "judge"/subjective check with a vague "looks good" rubric is a blocking gap unless its rubric is',
+    'concrete and falsifiable.',
     'Return CONTRACT_REVIEW. approved=true ONLY if there are zero blocking gaps. List every blocking gap.',
     'This is review only -- do NOT modify any files.',
   ].join('\n')
@@ -403,9 +424,10 @@ function initPrompt () {
     '   ".goalkeeper/" to ' + repo + '/.git/info/exclude if not already present (create that file if needed).',
     '3. RUNTIME state -- if ' + statePath + '/plan.json exists, read it and return: passing[] item ids, prevGoodHead,',
     '   iteration as startIteration, attempts{} (per-item failed-attempt counts), fpHistory[] ({hash,pass,head} per round),',
-    '   latched{} (per-nondeterministic-item: the git tree-hash at which its check last passed), and status (the plan.json',
-    '   "status" field, usually "in-progress" or "converged").',
-    '   If it does not exist, seed: passing=[], startIteration=0, attempts={}, fpHistory=[], latched={}, status="fresh", and',
+    '   latched{} (per-nondeterministic-item: the git tree-hash at which its check last passed), attemptLog{} (per-item',
+    '   recent failed-attempt reflections = the failure ledger), and status (the plan.json "status" field, usually',
+    '   "in-progress" or "converged").',
+    '   If it does not exist, seed: passing=[], startIteration=0, attempts={}, fpHistory=[], latched={}, attemptLog={}, status="fresh", and',
     '   set prevGoodHead to the current git HEAD sha (git -C "' + repo + '" rev-parse HEAD).',
     '4. WORKING CONTRACT -- if ' + statePath + '/contract.json exists, read it and return its items[], goal, replanCount,',
     '   critiqueRounds. If it does not exist, return items=[], goal="", replanCount=0, critiqueRounds=0.',
@@ -427,7 +449,7 @@ function persistContractPrompt (items, goalText, counters) {
   ].join('\n')
 }
 
-function builderPrompt (item, goalText) {
+function builderPrompt (item, goalText, priorAttempts, attemptNum, maxRetries) {
   return [
     'You are the BUILDER in an autonomous build loop. Stay strictly on task.',
     'OVERALL GOAL (restated so you do not drift): ' + goalText,
@@ -443,7 +465,17 @@ function builderPrompt (item, goalText) {
       ' (allowTestEdit=' + (!!item.allowTestEdit) + '). Editing a check to make it pass is cheating and will be reverted.',
     '  - NO placeholder, stub, mock-of-the-thing-under-test, or TODO implementations. Full real implementation only.',
     '  - FORBIDDEN actions, never perform: ' + j(denylist) + '.',
-    'PRIOR ATTEMPTS on this item and why they failed are in ' + statePath + '/worklog.md -- read it first; do NOT repeat a failed approach.',
+    ((priorAttempts && priorAttempts.length)
+      ? ('YOUR PRIOR FAILED ATTEMPTS on this exact item (most recent last) -- do NOT repeat any of these approaches:\n' +
+         priorAttempts.map(function (a) { return '  - round ' + a.iteration + ' (' + a.outcome + '): ' + (a.reflection || '') }).join('\n'))
+      : 'No prior failed attempts on this item yet.'),
+    'Further per-round detail is in ' + statePath + '/worklog.md.',
+    ((attemptNum && maxRetries && attemptNum >= (maxRetries - 1))
+      ? ('LAST ATTEMPT: you have already failed this item ' + attemptNum + ' time(s); after this it is ESCALATED to a human. ' +
+         'Do NOT iterate on the same approach -- take a FUNDAMENTALLY different one. If you are genuinely blocked, set ' +
+         'blocked=true with a precise, specific blockerReason (exactly what is missing or impossible) -- that is more useful ' +
+         'to the human than another failed guess.')
+      : ''),
     CHECK_SEMANTICS_NOTE,
     'WHEN DONE: run the item check yourself (honoring the semantics above), then commit ONLY your changes with message "goalkeeper: ' + item.id + '".',
     'Return BUILD_RESULT with the new git HEAD sha, whether you touched any checkPaths, and selfReportedPass.',
@@ -461,6 +493,14 @@ function verifierPrompt (item, prevGoodHead, passingIds, items) {
     'All checks resolve against the repo root: run commands with "' + repo + '" as the working directory; file_exists/grep paths are relative to "' + repo + '".',
     CHECK_SEMANTICS_NOTE,
     '1. Run THIS item check and set itemPassed: ' + j(item.check),
+    '1b. ANTI-GAMING (a passing check is necessary but NOT sufficient): inspect the builder\'s actual change with',
+    '    git -C "' + repo + '" diff ' + prevGoodHead + ' HEAD. Set suspectedGaming=true (+ a one-line gamingReason) if it',
+    '    passes by CHEATING rather than implementing: hardcoding the exact expected output/answer, special-casing the',
+    '    check\'s specific inputs, stubbing a constant return, a no-op / exit-0 / trivial pass, deleting or weakening',
+    '    assertions, or writing the check\'s expected sentinel without doing the real work. A genuine implementation',
+    '    generalizes beyond the check\'s literal inputs; if so, suspectedGaming=false.',
+    '1c. If itemPassed is false, set failureAnalysis: 1-3 sentences on WHY it failed plus a concrete WHAT-TO-CHANGE for the',
+    '    next attempt (more actionable than the raw output tail).',
     '2. REGRESSION check: these items were already passing: ' + j(passingIds) + '. Re-run THEIR checks at the current',
     '   HEAD and list by id any that now FAIL (those are regressions). If that list is empty, regressions=[]. When a',
     '   re-checked item is nondeterministic, apply its retry/passPolicy (above) so a flaky environmental miss is NOT',
@@ -536,11 +576,16 @@ function bookkeeperPrompt (data) {
     'Apply this round outcome to durable goalkeeper state in repo ' + repo + ' (state dir ' + statePath + ').',
     'Outcome data: ' + j(data),
     'Steps:',
-    '1. If doRevert is true: run  git -C "' + repo + '" reset --hard ' + data.revertTo + '  and capture the resulting HEAD.',
-    '   (Anti-destruction reset: ANY non-passing round rolls back to last-good so the tree never ratchets backward.)',
+    '1. If doRevert is true: FIRST preserve the discarded work best-effort (do NOT fail the task if this errors):',
+    '   git -C "' + repo + '" diff ' + data.revertTo + ' > "' + statePath + '/last-attempt-' + (data.item ? data.item.id : 'item') + '.patch"',
+    '   (this diffs last-good against the CURRENT working tree, so it captures the failed attempt whether it was committed OR',
+    '   left uncommitted; it may be empty if the attempt changed nothing). THEN run  git -C "' + repo + '" reset --hard ' +
+    '   ' + data.revertTo + '  and capture the resulting HEAD.',
+    '   (Anti-destruction reset: ANY non-passing round rolls back to last-good; the saved .patch keeps the discarded attempt inspectable.)',
     '2. Read ' + statePath + '/plan.json if present, then write it (RUNTIME state only) merged with: passing=' + j(data.passing) +
       ', attempts=' + j(data.attempts) + ', iteration=' + data.iteration + ', prevGoodHead=' + j(data.prevGoodHead) +
       ', latched=' + j(data.latched) + ' (per-nondeterministic-item tree-hash where its check last passed),' +
+      ' attemptLog=' + j(data.attemptLog) + ' (per-item recent failed-attempt reflections = the failure ledger),' +
       ' and APPEND this fingerprint (shape {hash,pass,head}) to fpHistory: ' + j(data.fingerprint) + '. Keep status="in-progress".',
     '   (The working contract lives in the SEPARATE contract.json -- do NOT read or write it here.)',
     '3. APPEND one entry to ' + statePath + '/worklog.md:  round ' + data.iteration + ', item ' + data.item.id +
@@ -766,6 +811,8 @@ const humanAmended = (cfg.resetAttempts || []).length > 0
 ;(cfg.resetAttempts || []).forEach(function (id) { delete retries[id] })
 const fpHistory = (init.fpHistory || []).slice()
 var latched = Object.assign({}, init.latched || {}) // per-nondeterministic-item: tree-hash where its check last passed
+var attemptLog = Object.assign({}, init.attemptLog || {}) // per-item recent failed-attempt reflections (the failure ledger)
+;(cfg.resetAttempts || []).forEach(function (id) { delete attemptLog[id] }) // a human attempt-reset clears the ledger too, so stale "do not repeat" guidance cannot contradict the human's fix
 var stallCount = humanAmended ? 0 : computeStall(fpHistory)
 var iteration = init.startIteration || 0
 var replanCount = init.replanCount || 0
@@ -916,8 +963,21 @@ while (true) {
   const item = ready[0] // sequential, dependency-ordered (concurrent execution deferred to worktrees)
 
   // ---- hard backstops ----
-  if (iteration >= caps.maxIterations || budgetExhausted()) {
-    return await escalate('budget-exhausted', { iteration: iteration, maxIterations: caps.maxIterations, item: item })
+  const tokenOut = budgetExhausted()
+  if (iteration >= caps.maxIterations || tokenOut) {
+    const spentDelta = (budget && typeof budget.spent === 'function') ? (budget.spent() - tokenBaseline) : null
+    const perRunToken = !!(caps.maxTokens && spentDelta !== null && spentDelta >= caps.maxTokens)
+    // Distinguish the three limiters: the iteration cap, the per-RUN caps.maxTokens, and the shared turn/session budget
+    // (budget.remaining()<=0 with no per-run cap). Raising caps.maxTokens only helps the second; the third needs a fresh turn.
+    const budgetKind = (iteration >= caps.maxIterations) ? 'iteration' : (perRunToken ? 'token' : 'session')
+    const advice = budgetKind === 'iteration' ? 'raise caps.maxIterations, then re-invoke to resume'
+      : budgetKind === 'token' ? 'raise caps.maxTokens, then re-invoke to resume'
+      : 'the shared turn/session budget is exhausted -- re-invoke in a fresh turn to resume (raising caps.maxTokens will not help)'
+    return await escalate('budget-exhausted', {
+      budgetKind: budgetKind, iteration: iteration, maxIterations: caps.maxIterations,
+      tokensSpent: spentDelta, maxTokens: caps.maxTokens, item: item,
+      note: 'Halted (' + budgetKind + '-budget). Best-good state is committed at HEAD ' + prevGoodHead + '; the last failed attempt (if any) is saved as ' + statePath + '/last-attempt-*.patch (may be empty if it changed nothing). To continue: ' + advice + '.',
+    })
   }
 
   // ---- leash batch boundary ----
@@ -940,7 +1000,8 @@ while (true) {
   log('round ' + iteration + ' -> item ' + item.id)
 
   // ---- build (one item; sequential by design) ----
-  const build = await agent(builderPrompt(item, goalText), { label: 'build:' + item.id + '#' + iteration, phase: 'Loop', schema: BUILD_RESULT })
+  const priorAttempts = (attemptLog[item.id] || []).slice(-3)
+  const build = await agent(builderPrompt(item, goalText, priorAttempts, (retries[item.id] || 0), caps.maxItemRetries), { label: 'build:' + item.id + '#' + iteration, phase: 'Loop', schema: BUILD_RESULT })
 
   // ---- LIVING RE-PLAN: builder discovered the contract is wrong ----
   if (build.replanRequest && build.replanRequest.requested) {
@@ -981,6 +1042,9 @@ while (true) {
       outcome = 'revert-tamper'; reflection = 'builder modified write-protected check files'
     } else if (realRegr.length > 0) {
       outcome = 'revert-regression'; reflection = 'regressed: ' + realRegr.join('; ')
+    } else if (v.itemPassed && v.suspectedGaming && !item.allowTestEdit) {
+      // the check passed but the verifier judges it GAMED (hardcoded/stubbed/sentinel), not a real implementation -> not durable.
+      outcome = 'revert-gaming'; reflection = 'suspected check-gaming, not a real implementation: ' + (v.gamingReason || 'see verifier')
     } else if ((v.itemPassed || focalLatchHit) && (v.workingTreeClean !== false)) {
       outcome = 'passed'; head = v.headSha
       reflection = (focalLatchHit && !v.itemPassed) ? 'nondeterministic check latched-green at this tree (environmental miss excused)' : (v.summary || 'item check green; no regressions')
@@ -988,7 +1052,7 @@ while (true) {
     } else if (v.itemPassed && v.workingTreeClean === false) {
       outcome = 'failed'; reflection = 'item check passed but the working tree has uncommitted source changes; not a durable pass'
     } else {
-      outcome = 'failed'; reflection = (v.checkOutputTail || 'check not satisfied').slice(0, 400)
+      outcome = 'failed'; reflection = v.failureAnalysis || (v.checkOutputTail || 'check not satisfied').slice(0, 400)
     }
   }
 
@@ -996,21 +1060,30 @@ while (true) {
   const doReset = (outcome !== 'passed')
   if (outcome === 'passed') {
     passingSet.add(item.id); retries[item.id] = 0; prevGoodHead = head
+    delete attemptLog[item.id] // item done; drop its failure ledger to keep state small
   } else {
     retries[item.id] = (retries[item.id] || 0) + 1
+    const ledger = (attemptLog[item.id] = attemptLog[item.id] || [])
+    ledger.push({ iteration: iteration, outcome: outcome, reflection: String(reflection || '').slice(0, 300) })
+    if (ledger.length > 5) attemptLog[item.id] = ledger.slice(-5) // keep only the most recent few
   }
   passingCount = passingSet.size
   const effHead = (outcome === 'passed') ? head : prevGoodHead
 
   const bk = await agent(bookkeeperPrompt({
     item: { id: item.id }, outcome: outcome, doRevert: doReset, revertTo: prevGoodHead,
-    passing: Array.from(passingSet), attempts: retries, iteration: iteration, latched: latched,
+    passing: Array.from(passingSet), attempts: retries, iteration: iteration, latched: latched, attemptLog: attemptLog,
+    builderHead: (build && build.headSha) ? build.headSha : '',
     prevGoodHead: prevGoodHead, fingerprint: { hash: hash, pass: passingCount, head: effHead }, reflection: reflection,
   }), { label: 'book:' + item.id + '#' + iteration, phase: 'Loop', effort: 'low', schema: BOOKKEEP_RESULT })
 
   // ---- per-item retry cap ----
   if (outcome !== 'passed' && retries[item.id] >= caps.maxItemRetries) {
-    return await escalate('item-stuck', { item: item, attempts: retries[item.id], lastOutcome: outcome, lastReflection: reflection })
+    return await escalate('item-stuck', {
+      item: item, attempts: retries[item.id], lastOutcome: outcome, lastReflection: reflection,
+      attemptLog: (attemptLog[item.id] || []),
+      lastAttemptPatch: statePath + '/last-attempt-' + item.id + '.patch',
+    })
   }
 
   // ---- oscillation ----

@@ -1,5 +1,5 @@
 {
-  "_comment": "RUNTIME STATE (the durable spine, half 1 of 2). Lives at <repo>/.goalkeeper/plan.json and holds ONLY loop runtime: status, passing, attempts, iteration, prevGoodHead, and fpHistory. The durable WORKING CONTRACT (goal, items, replanCount, critiqueRounds) now lives in a SEPARATE file, contract.json, beside this one; the bookkeeper writes plan.json every round and never touches contract.json. The init step reads BOTH at the start of a run. A fresh `goalkeeper` invocation does NOT start over: it loads this file and resumes by restoring `passing`, `attempts`, `prevGoodHead`, `iteration`, and `fpHistory` (all of these round-trip). From those, the 3-retry, no-progress, and oscillation guards are rebuilt exactly where the last run left off. The script merges these fields verbatim, so keep the keys exactly as named.",
+  "_comment": "RUNTIME STATE (the durable spine, half 1 of 2). Lives at <repo>/.goalkeeper/plan.json and holds ONLY loop runtime: status, passing, attempts, iteration, prevGoodHead, and fpHistory. The durable WORKING CONTRACT (goal, items, replanCount, critiqueRounds) now lives in a SEPARATE file, contract.json, beside this one; the bookkeeper writes plan.json every round and never touches contract.json. The init step reads BOTH at the start of a run. A fresh `goalkeeper` invocation does NOT start over: it loads this file and resumes by restoring `passing`, `attempts`, `prevGoodHead`, `iteration`, `fpHistory`, `latched` (per-nondeterministic-item tree-hash where its check last passed), and `attemptLog` (the per-item Reflexion failure ledger, re-injected into the next builder attempt) (all of these round-trip). From those, the 3-retry, no-progress, and oscillation guards are rebuilt exactly where the last run left off. The script merges these fields verbatim, so keep the keys exactly as named.",
   "status": "in-progress",
   "passing": ["middleware-exists", "unit-tests-pass"],
   "attempts": {
@@ -18,5 +18,12 @@
     { "hash": "d4e5f60718293a4b5c6d7e8f9012345678901234", "pass": 2, "head": "9c4f1ab7e2d3590fa18b6c0d4e7a2f3b5c8d9e01" },
     { "hash": "e5f60718293a4b5c6d7e8f901234567890123456", "pass": 2, "head": "9c4f1ab7e2d3590fa18b6c0d4e7a2f3b5c8d9e01" },
     { "hash": "f60718293a4b5c6d7e8f90123456789012345678", "pass": 2, "head": "9c4f1ab7e2d3590fa18b6c0d4e7a2f3b5c8d9e01" }
-  ]
+  ],
+  "latched": {},
+  "attemptLog": {
+    "over-limit-returns-429": [
+      { "iteration": 4, "outcome": "revert-regression", "reflection": "reused the bucket but mutated module-level state across requests; regressed the unit suite" },
+      { "iteration": 5, "outcome": "failed", "reflection": "off-by-one: compared the limit before the token decrement, so the (N+1)th request still returned 200" }
+    ]
+  }
 }
