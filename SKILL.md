@@ -20,6 +20,8 @@ The defining risk this skill addresses is the opposite of laziness. An eager loo
 
 These are described in detail below; the contract is therefore mutable and durable, surviving resume.
 
+**Optional power features (all opt-in, all default-off).** Four newer capabilities are gated behind flags and change nothing unless you turn them on. With no flags set, Goalkeeper behaves exactly as described above. They are: **best-of-N builders** (`caps.candidates` > 1: build N diverse candidate solutions for a hard item and let the deterministic contract pick the winner, no LLM judge); **step memoization** (`memoize: true`: call-granular crash-resume that skips re-running a builder/verifier call whose inputs are unchanged); a **durable approval token** (`approveToken: true`: resolve an escalation by writing a small file instead of re-invoking with args); and a **repo map** (`caps.repoMap`: a cheap, token-bounded file/symbol map written once at setup to ground the planner and builder). Each is detailed in its own section below.
+
 ## Architecture: three layers
 
 **1. The brain is code, not a prompt.** The stop logic lives in a fixed Workflow script at `goalkeeper.workflow.js`, invoked via the Workflow tool. Convergence, the 3-retry rule, no-progress detection, oscillation detection, and the budget backstop are all evaluated deterministically in that script. They are not the model's *memory* of how it is supposed to behave, so they cannot be argued away mid-run, forgotten after a `/clear`, or talked around by an over-helpful agent.
@@ -29,6 +31,8 @@ These are described in detail below; the contract is therefore mutable and durab
 - `plan.json` — **runtime state only**: `status`, the set of `passing` item ids, per-item `attempts` (retry counts), the current `iteration`, `prevGoodHead` (the last known-green git SHA), `fpHistory` (the fingerprint history used for no-progress and oscillation detection), `latched` (the tree-hashes at which a `nondeterministic` check has banked a pass, so a later flaky miss at the same tree does not revert or un-converge the run), and `attemptLog` (the per-item **failure ledger**: each failed attempt's structured "why it failed + what to change", a few most-recent kept per item, re-injected into the next builder attempt). The bookkeeper writes this every round, and the latch and ledger survive resume.
 - `contract.json` — the **durable working contract**: `goal`, `items` (each with its `expectedOutput`, `check`, and `dependsOn`), and the two spent budgets `replanCount` and `critiqueRounds`. This is the contract the loop is *actually* building to right now, which can differ from what you first handed in (the planner may have generated it, self-critique may have appended items, a re-plan may have split items). It is written only by the planner/seed/re-plan/self-critique persist steps; the bookkeeper never touches it.
 - `worklog.md` — an append-only log of per-round reflections.
+
+Three further files appear **only when the matching opt-in feature is on**, and are otherwise absent: `results.json` (the memoization ledger, `memoize: true`), `resolution.json` (a human-written durable-token resolution to consume, `approveToken: true`), and `repomap.md` (the generated, git-ignored repo map, `caps.repoMap` other than `'off'`). They are documented under "Optional power features".
 
 Splitting runtime state from the working contract is deliberate: the bookkeeper rewrites `plan.json` every round, but the contract must not be at risk of a bookkeeping overwrite, so it lives in its own file written only when it genuinely changes.
 
@@ -55,8 +59,19 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
     maxIterations: 20, maxItemRetries: 3, maxStalls: 3, maxTokens: null,
     maxReplans: 2,               // living re-plan: max contract revisions before escalating (replan-budget)
     maxCritiqueRounds: 1,        // self-critique: max critique passes before converging anyway
-    scopeCheckEvery: 4           // scope checkpoint cadence in rounds; 0 disables
+    scopeCheckEvery: 4,          // scope checkpoint cadence in rounds; 0 disables
+    // ---- best-of-N builders (opt-in; default 1 = single builder, unchanged) ----
+    candidates: 1,               // N diverse candidate solutions per hard item; the contract (not an LLM judge) picks the winner. Default 1 = off
+    candidatesHardOnly: true,    // true: the FIRST try of an item is a single builder; only retries fan out to N (pay N-cost only where the loop struggles)
+    maxCandidates: 6,            // hard ceiling on N regardless of per-item override
+    maxPlateau: 8,               // halt with reason `plateau` if passing-count does not increase for this many rounds (best-of-N backstop)
+    // ---- repo map (opt-in; default 'off') ----
+    repoMap: "off",              // 'off' | 'tree' (ranked file tree) | 'symbols' (ctags->git-grep->tree fallback, with top-level symbols)
+    repoMapTokens: 1500,         // token budget for the generated .goalkeeper/repomap.md
+    repoMapRefreshEvery: 0       // refresh the map every N rounds (0 = only at setup + after a re-plan/self-critique)
   },
+  memoize: false,                // opt-in: call-granular crash-resume. Builder/verifier calls keyed by an input fingerprint; a completed call returns its stored result from .goalkeeper/results.json instead of re-running
+  approveToken: false,           // opt-in: resolve an escalation by writing .goalkeeper/resolution.json {token, action} instead of re-invoking with resume args
   denylist: ["git push","deploy","secrets","external-send"],  // forbidden actions, enforced regardless of mode
   telegram: { chatId: null },    // best-effort doorbell
   approvals: [],                 // leash: e.g. ["start"] to clear the pre-build gate; ["contract-gaps"] to proceed past blocking spec gaps
@@ -78,7 +93,7 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
 **Item fields that shape scheduling:**
 
 - `expectedOutput` — the concrete artifact or observable result that proves the item is done. It is what the builder aims to produce; `check` is how the loop measures it.
-- `dependsOn` — an array of item ids that must be passing before this item is eligible. This enables **dependency-ordered scheduling**: the loop only ever picks an item whose dependencies are all green. (Note: dependency-*aware* scheduling is implemented, but execution is still **sequential**, one item per round. *Concurrent* execution is deferred to per-round git worktrees, the standing deferral. So items run in a dependency-respecting order, not in parallel.)
+- `dependsOn` — an array of item ids that must be passing before this item is eligible. This enables **dependency-ordered scheduling**: the loop only ever picks an item whose dependencies are all green. (Note: dependency-*aware* scheduling is implemented, but **item** execution is still **sequential**, one item per round, in a dependency-respecting order, not in parallel. The opt-in best-of-N builder does run several candidate builders **for a single item**, but they too run **sequentially on the live repo** (one resets to last-good, builds, is verified, then the next), not in parallel worktrees. *Concurrent* execution of **different items** still needs true parallel git worktrees and remains the standing deferral, because the runtime's worktree isolation was found non-viable for an arbitrary target repo.)
 
 Write the contract carefully. Goalkeeper is extremely good at converging on whatever you actually wrote, which is exactly why a sloppy contract is dangerous: a perfectly-green run against the wrong checks is worse than a failed run, because it *looks* finished. The spec-review step below exists precisely to catch this before any code is written.
 
@@ -117,6 +132,60 @@ check: { type: "pipeline", build: "make -j", deploy: "make flash",
 ```
 
 These capabilities compose: a pipeline check can itself be `nondeterministic` (hardware deploy whose smoke test is flaky) and can pin a `shell`.
+
+## Optional power features (opt-in, default-off)
+
+Four capabilities are gated behind flags. **None of them changes the default behavior:** with no flags set (`caps.candidates` 1, `memoize` false, `approveToken` false, `caps.repoMap` `'off'`), Goalkeeper runs exactly as described in the rest of this document. Turn one on only when its trade-off is worth it.
+
+### Best-of-N builders (`caps.candidates`, default 1)
+
+When `caps.candidates > 1`, a hard item is built by **N diverse candidate solutions** and the **deterministic contract** picks the winner. There is **no LLM judge**: the independent verifier runs each candidate's check and the winner is the one that genuinely passes (ties break by priority order, e.g. fewest regressions / first to pass). The selection is the same external check the loop always trusts, so best-of-N cannot launder a losing solution into a win.
+
+**The candidates run sequentially on the live repo, not in parallel worktrees.** For each candidate in turn: the repo is reset to last-good, the builder is asked to take a *different* approach guided by a **diversity hint** (so the N attempts are genuinely distinct, not N copies of the same idea), and the candidate is verified in place. The winning candidate's commit is then promoted by **cherry-pick**. A true-parallel-worktree mechanism was tried and is **not viable** in this runtime, so the N attempts are serialized; you get candidate diversity, not wall-clock parallelism.
+
+Configuration:
+
+- `caps.candidates`: N, **default 1** (a single builder, unchanged). An individual item may set its own `candidates` to override the cap for just that item.
+- `caps.candidatesHardOnly`: **default true**. The **first** try of an item is always a single builder; only **retries** fan out to N. So you pay the N-cost only on items the loop is actually struggling with. Set false to fan out from the first attempt.
+- `caps.maxCandidates`: a hard ceiling on N (**default 6**), enforced even against a per-item override.
+- A **budget-degrade** automatically reduces N when the per-run token budget is low, so best-of-N cannot blow the budget on a single round.
+
+**Cost.** Candidates multiply a round's build+verify token cost by up to N. That is the whole trade-off: more attempts at a hard item for proportionally more tokens. Keep `candidatesHardOnly` on (the default) so the multiplier only applies where it earns its keep, and set a `maxTokens` cap.
+
+**Failure semantics are unchanged.** If **no** candidate passes, it is just a normal **failed round**: every one of the N attempts is recorded in the failure ledger (`attemptLog`), the round reverts to last-good, and it counts against the item's retry budget so **item-stuck** still bounds it at 3. Best-of-N makes a hard item *more likely* to pass; it never weakens any stop condition.
+
+**The `plateau` stop (a best-of-N backstop).** Because best-of-N can advance git HEAD by promoting a winning candidate **without a new item passing**, the usual no-progress fingerprint could in principle keep moving while the passing-count stays flat. So there is a `maxPlateau` stop (**default 8**): if the **passing-count does not increase for that many rounds**, the run halts with reason `plateau`. On the normal single-builder path this is dominated by item-stuck and no-progress (which fire first and name the blocking item), so `plateau` is effectively a backstop for the best-of-N case where HEAD advances but the contract does not get closer to done.
+
+### Step memoization (`memoize`, default false)
+
+`memoize: true` adds **call-granular crash-resume**. The expensive builder and verifier calls are keyed by a **deterministic fingerprint of their inputs** (the input tree, the item's check, and the other call inputs), and each call's result is stored in `.goalkeeper/results.json`. On a re-invocation, a call whose fingerprint matches a **completed** stored result returns that stored result **instead of re-running** the agent, so a crash-and-resume does not pay twice for work already done (no duplicate LLM spend).
+
+**Invalidation is structural, so a stale result is never replayed.** A changed check or a changed input tree produces a **different key**, so the old result simply does not match and the call recomputes. There is no time-based or manual invalidation to get wrong. And the cache only ever *skips* recomputation, never *forces* a wrong answer: a **corrupt, missing, or contract-mismatched** ledger degrades to a normal recompute (it is never read as a result). The ledger is **dropped on a contract amend / redirect** (the inputs changed, so the cache is moot) and **archived on converge / `freshStart`** alongside the rest of the run state.
+
+### Durable approval token (`approveToken`, default false)
+
+By default you resolve an escalation by **re-invoking** Goalkeeper with resume args (`approvals`, `amendContract`, `resetAttempts`, a hint). `approveToken: true` adds a **file-based** alternative for environments where re-invoking with args is awkward.
+
+On each escalation Goalkeeper **mints a deterministic token** (shown in `ESCALATION.md`). A human resolves the halt by writing **`.goalkeeper/resolution.json`** containing `{ token, action }`, where `action` is one of:
+
+- `approve`: clear the gate and continue (maps onto `approvals`).
+- `redirect`: revise the contract (maps onto `amendContract`, with optional `amendItems`).
+- `abandon`: stop the run.
+- `hint`: continue with a Reflexion-style **hint** fed to the next builder (optional `hint` text).
+
+On the next invocation Goalkeeper **consumes the token once**, maps the action onto the existing resume levers (approvals / `amendContract` / `resetAttempts` / a Reflexion hint), and continues. A token that **does not match the active halt** is **ignored** (the run stays halted), so a stale or wrong-run resolution file cannot accidentally release a different escalation. The durable token is just a second front door onto the same resume machinery; the args path keeps working unchanged.
+
+### Repo map (`caps.repoMap`, default 'off')
+
+`caps.repoMap` gives the planner and builder cheap **grounding** in an unfamiliar repository. When enabled, a low-cost agent writes a **token-bounded `.goalkeeper/repomap.md`** (ranked key files plus, in `symbols` mode, their top-level symbols) and the planner and builder **read it** so they are not exploring the tree blind.
+
+- `caps.repoMap: 'off'` (default): no map is generated.
+- `caps.repoMap: 'tree'`: a **ranked file tree** (the key files, ordered by relevance).
+- `caps.repoMap: 'symbols'`: the ranked tree **plus top-level symbols**, built via a **ctags -> git-grep -> tree fallback** chain (it uses ctags if available, falls back to git-grep, then to a plain tree, so it degrades gracefully on a repo without ctags).
+- `caps.repoMapTokens`: the token budget for the generated map (**default 1500**).
+- `caps.repoMapRefreshEvery`: if > 0, the map is **refreshed every N rounds**; at 0 (default) it is written **once at setup** and refreshed only after a **re-plan or self-critique** changes the shape of the work.
+
+The map is **git-ignored** and is **never a gate**: it only informs the planner and builder, it is not a check and cannot fail a round. It is pure context, bounded in cost by `repoMapTokens`.
 
 ## The workflow phases
 
@@ -169,6 +238,8 @@ Each of these is evaluated in code at the end of a round. Each cites the prior a
 
 - **Oscillation.** The loop returns to a recently-seen tree-state without the passing-count having increased → halt. Going in circles is treated as being stuck. (Modeled on OpenHands' ping-pong / loop detector.)
 
+- **Plateau** (a best-of-N backstop). The passing-count does not increase for `maxPlateau` consecutive rounds (default 8) → halt with reason `plateau`. This exists because the opt-in best-of-N builder can advance git HEAD by promoting a winning candidate without a *new item* passing, so a run could move while getting no closer to done. On the normal single-builder path it is dominated by **item-stuck** and **no-progress** (which fire first and name the blocking item), so it is effectively a backstop for best-of-N rather than a primary stop.
+
 - **Budget backstop.** `maxIterations` or the token budget is exhausted → enter a **distinct "halted, not done" terminal state** that *always* routes to a human. This is never silently relabeled as success. The halt records *which* limiter tripped via a `budgetKind` field (`"iteration"` for the `maxIterations` cap, `"token"` for the per-run `caps.maxTokens` delta, or `"session"` when the shared turn budget is exhausted), reports the per-run tokens spent, and gives the matching resume advice. The distinction matters because a `"session"` halt will **not** be fixed by raising `caps.maxTokens`; it needs a re-invoke in a fresh turn. (Modeled on Semantic Kernel's two distinct terminal states and LangGraph's `recursion_limit`, whose default is 25.)
 
 The budget backstop and convergence are *different* terminal states on purpose. "We ran out of budget" must never be reported as "we finished."
@@ -192,6 +263,7 @@ Any non-converged stop writes **`ESCALATION.md`** to `<repo>/.goalkeeper/` and t
 - **`item-stuck`** — one item failed its check 3 times. The escalation points at `.goalkeeper/last-attempt-<itemId>.patch`, the diff of the final discarded attempt (which may be empty if it changed nothing).
 - **`no-progress`** — 3 consecutive rounds with no new pass and no HEAD advance.
 - **`oscillation`** — the loop returned to a recently-seen tree-state without progress.
+- **`plateau`**: the passing-count did not increase for `maxPlateau` rounds (default 8); a best-of-N backstop for when HEAD advances but no new item passes.
 - **`budget-exhausted`** — `maxIterations`, the per-run token budget, or the shared session turn budget ran out; a `budgetKind` field (`"iteration"` / `"token"` / `"session"`) names which, and the per-run tokens spent and resume advice are tailored to it (a `"session"` halt needs a fresh turn, not a higher `maxTokens`). It points at `.goalkeeper/last-attempt-<itemId>.patch` for the in-flight item's discarded work.
 - **`final-suite-failed`** — all items passed individually but the final full-suite check did not.
 - **`contract-incomplete`** — the spec-review found blocking gaps in the contract.
@@ -216,6 +288,8 @@ Any non-converged stop writes **`ESCALATION.md`** to `<repo>/.goalkeeper/` and t
 - To give a stuck item a fresh retry budget on a human-amended resume (e.g. after relaxing its check), pass `resetAttempts: ["<item-id>"]`, which clears that item's retry count, resets the stall counter, **and clears its `attemptLog` failure ledger** so old "do not repeat" guidance cannot contradict your fix.
 
 Because all state is on disk, resuming is just running the skill again against the same repo.
+
+**Resolving via a durable token (opt-in, `approveToken: true`).** If you turned on the durable approval token, you have a second way to resolve a halt that does not require re-invoking with resume args. Each escalation mints a deterministic **token** (printed in `ESCALATION.md`); write **`.goalkeeper/resolution.json`** = `{ token, action }` where `action` is one of `approve` | `redirect` | `abandon` | `hint` (with optional `hint` text or `amendItems`). On the next invocation Goalkeeper consumes that token **once** and maps the action onto the same resume levers above (`approve` -> approvals, `redirect` -> `amendContract`/`amendItems`, `resetAttempts` where relevant, `hint` -> a Reflexion hint). A token that does **not** match the active halt is ignored and the run stays halted, so a stale resolution file cannot release the wrong escalation.
 
 ## Close-out on success
 
@@ -263,9 +337,9 @@ This extends the existing close-out behavior — which already archived a **conv
 
 Three things are deferred, all sharing the same safety property (a bad round can never corrupt good work) with fully-understood semantics:
 
-1. **Concurrent execution is deferred.** Dependency-*aware* scheduling is in: items run in a dependency-respecting order. But execution is still **sequential**, one item per round. Running independent items *concurrently* needs per-round git worktrees, because concurrent commits to one repo would break reset-on-fail, so it is deferred.
+1. **Concurrent execution of different items is deferred.** Dependency-*aware* scheduling is in: items run in a dependency-respecting order. But **item** execution is still **sequential**, one item per round. (The opt-in best-of-N builder does run several candidate builders **for a single item** within a round, but those run **sequentially on the live repo**, not in parallel.) Running **independent items** *concurrently* needs true per-round git worktrees, because concurrent commits to one repo would break reset-on-fail, so it remains deferred.
 
-2. **No per-round git worktree yet.** The loop uses snapshot-HEAD plus reset-on-fail on the *live* repo. This preserves the core guarantee — a bad round is reset to `prevGoodHead` — but proper isolated worktrees (which also unlock deferral 1) are deferred pending a check of the Workflow execution lifecycle.
+2. **No true parallel git worktree.** The loop (and best-of-N's candidate attempts) use snapshot-HEAD plus reset-on-fail on the *live* repo, serialized. This preserves the core guarantee (a bad round/candidate is reset to `prevGoodHead`) but proper **isolated parallel worktrees** (which would unlock deferral 1 and wall-clock-parallel candidates) stay deferred: the runtime's worktree isolation was found **non-viable** for an arbitrary target repo, so best-of-N serializes its candidates rather than running them in parallel worktrees.
 
 3. **The wall-clock cap is soft.** The scripts cannot read the clock, so there is no hard time limit. The hard backstops that *do* stop a runaway loop are the iteration count and the token budget.
 
@@ -275,7 +349,7 @@ Three things are deferred, all sharing the same safety property (a bad round can
 
 **Denylist.** The forbidden actions — `git push`, `deploy`, `secrets`, `external-send` — are enforced in **both** autonomy modes, regardless of `mode` or `autonomy`. Goalkeeper operates inside the repo and does not reach outside it.
 
-**Kill switch.** To stop a run, **stop the Workflow** from `/workflows`. To reset Goalkeeper's state entirely, **delete the `.goalkeeper/` directory** (under `<repo>/`). That clears *both* state files, `plan.json` (runtime, including the `attemptLog` failure ledger) and `contract.json` (working contract), plus `worklog.md`, any `ESCALATION.md` or `REPORT.md`, any `last-attempt-<itemId>.patch` snapshots of discarded attempts, and the `archive/` of past converged runs. The next invocation then starts fresh from the contract you pass in (or re-plans from the goal). You rarely need to do this by hand: a **converged** run self-documents via `REPORT.md` and auto-archives when you give it a new task, and `freshStart: true` archives any leftover state for you. Deleting the directory remains the blunt full reset.
+**Kill switch.** To stop a run, **stop the Workflow** from `/workflows`. To reset Goalkeeper's state entirely, **delete the `.goalkeeper/` directory** (under `<repo>/`). That clears *both* state files, `plan.json` (runtime, including the `attemptLog` failure ledger) and `contract.json` (working contract), plus `worklog.md`, any `ESCALATION.md` or `REPORT.md`, any `last-attempt-<itemId>.patch` snapshots of discarded attempts, the opt-in `results.json` (memoization ledger), `resolution.json` (a pending durable-token resolution), and `repomap.md` (the generated repo map), and the `archive/` of past converged runs. The next invocation then starts fresh from the contract you pass in (or re-plans from the goal). You rarely need to do this by hand: a **converged** run self-documents via `REPORT.md` and auto-archives when you give it a new task, and `freshStart: true` archives any leftover state for you. Deleting the directory remains the blunt full reset.
 
 ## Example invocation
 
@@ -302,7 +376,9 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
   },
   checkPaths: ["tests/**"],
   caps: { maxIterations: 20, maxItemRetries: 3, maxStalls: 3, maxTokens: null,
-          maxReplans: 2, maxCritiqueRounds: 1, scopeCheckEvery: 4 },
+          maxReplans: 2, maxCritiqueRounds: 1, scopeCheckEvery: 4,
+          candidates: 1, repoMap: "off" },   // opt-in power features off by default
+  // memoize / approveToken default false; omit them to keep the default behavior
   denylist: ["git push","deploy","secrets","external-send"],
   telegram: { chatId: null }
 }})

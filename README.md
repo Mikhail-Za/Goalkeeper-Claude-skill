@@ -40,6 +40,17 @@ It also has a planning and self-correction layer built in (a "fable-mode" workfl
 
 ---
 
+## Optional power features (opt-in, default-off)
+
+Four extra capabilities are gated behind flags and **change nothing unless you turn them on**. With no flags set, Goalkeeper behaves exactly as described above.
+
+- **Best-of-N builders** (`caps.candidates` > 1, default 1). For a hard item, Goalkeeper builds **N diverse candidate solutions** and the **deterministic contract** (the independent verifier) picks the winner: there is **no LLM judge**. The candidates run **sequentially on the live repo** (each resets to last-good, builds a different approach guided by a diversity hint, is verified in place; the winning commit is promoted by cherry-pick), not in parallel worktrees. By default only **retries** fan out (`candidatesHardOnly`), so you pay the N-cost only where the loop is struggling, and N is capped (`maxCandidates`, default 6). If no candidate passes it is a normal failed round and item-stuck still bounds it. Cost: candidates multiply a round's build+verify token cost by up to N. A related `maxPlateau` stop (default 8) halts with reason `plateau` if the passing-count does not advance for that many rounds (a best-of-N backstop, since promoting a winner can move HEAD without a new item passing).
+- **Step memoization** (`memoize: true`, default false). Call-granular crash-resume: the expensive builder and verifier calls are keyed by a deterministic fingerprint of their inputs and their results stored in `.goalkeeper/results.json`, so a re-invocation returns a completed call's stored result instead of re-running it (no duplicate LLM spend). Invalidation is structural (a changed check or tree yields a different key), and a corrupt or missing ledger just degrades to recompute, so a stale result is never replayed.
+- **Durable approval token** (`approveToken: true`, default false). Instead of resolving an escalation by re-invoking with args, each escalation mints a deterministic token (shown in `ESCALATION.md`); a human writes `.goalkeeper/resolution.json` = `{ token, action }` (`action` is `approve` | `redirect` | `abandon` | `hint`) and the next invocation consumes it once, mapping it onto the existing resume levers. A token that does not match the active halt is ignored.
+- **Repo map** (`caps.repoMap`, default `'off'`). A cheap agent writes a token-bounded `.goalkeeper/repomap.md` (ranked key files in `'tree'` mode, plus top-level symbols via a ctags → git-grep → tree fallback in `'symbols'` mode; budget `caps.repoMapTokens`, default 1500) once at setup (refreshed after a re-plan/self-critique, or every `caps.repoMapRefreshEvery` rounds if > 0), and the planner and builder read it for grounding. It is git-ignored and never a gate.
+
+---
+
 ## Requirements
 
 Goalkeeper drives Claude Code's **dynamic workflows** runtime (it ships a JavaScript orchestrator that the skill runs via the Workflow tool). That runtime is gated, so check the following before installing:
@@ -112,7 +123,11 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
   contract: { goal: "Add CSV export to the report page with full test coverage" },
   contractPath: null,            // optional: absolute path to a JSON file { goal, items[] }. Read at init, bypassing the args channel. Use for LARGE explicit contracts (inline args can truncate).
   checkPaths: ["tests/**"],
-  caps: { maxIterations: 20, maxTokens: 500000 },
+  caps: { maxIterations: 20, maxTokens: 500000,
+          candidates: 1,         // opt-in best-of-N builders; default 1 = single builder (off)
+          repoMap: "off" },      // opt-in repo map; 'off' (default) | 'tree' | 'symbols'
+  memoize: false,                // opt-in call-granular crash-resume (skip re-running unchanged builder/verifier calls)
+  approveToken: false,           // opt-in: resolve an escalation by writing .goalkeeper/resolution.json instead of re-invoking
   denylist: ["git push","deploy","secrets","external-send"],
   freshStart: false              // optional: archive any existing goalkeeper state (even an unfinished run) and start this task on a clean slate
 }})
