@@ -1242,6 +1242,7 @@ function closeOutPrompt (data) {
     'made (run git -C "' + repo + '" log --oneline -' + ((data.iterations || 0) + 5) + ' and include the lines whose message',
     'starts with "goalkeeper:"); Iterations (' + data.iterations + '); a short Summary of what was built (from the worklog);',
     'and any minor non-blocking weaknesses the self-critique flagged (may be empty): ' + j(data.weaknesses || []) + '.',
+    'Then DELETE any now-stale halt markers in the state dir so they cannot contradict this converged run: remove ' + statePath + '/ESCALATION.md and ' + statePath + '/AWAITING-HUMAN.md IF they exist (the run converged, so any leftover halt/pause notice from an earlier round is stale; REPORT.md is the success record). Best-effort: if a delete fails, ignore it and proceed. Do NOT delete plan.json/contract.json/worklog.md/REPORT.md or any other file.',
     'Do NOT touch git or source files. Return CLOSEOUT_RESULT { reportWritten: true, path: "' + statePath + '/REPORT.md" }.',
   ].join('\n')
 }
@@ -1472,7 +1473,9 @@ async function persistContract (counters) {
   } catch (e) { return { ok: false, error: String(e) } }
 }
 
-// On convergence: write the completion report (the success analog of ESCALATION.md). Best-effort.
+// On convergence: write the completion report (the success analog of ESCALATION.md) AND delete any now-stale halt
+// markers (a leftover ESCALATION.md / AWAITING-HUMAN.md from an earlier halt in this run). Both best-effort; status is
+// already stamped converged before this runs, so a cleanup failure can never un-converge the run.
 async function closeOut (data) {
   try {
     const r = await agent(closeOutPrompt(data), { label: 'close-out', phase: 'Review', effort: 'low', schema: CLOSEOUT_RESULT })
