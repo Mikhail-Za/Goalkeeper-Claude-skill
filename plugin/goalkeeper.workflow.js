@@ -116,6 +116,17 @@ const DIAG_ON = diag !== null
 // run taught about DRIVING goalkeeper" note to LESSONS.md (at libraryPath when LIB_ON, else the repo state dir), so the
 // operating playbook grows from real runs instead of manual folding. Best-effort; never affects the run outcome.
 const RETRO_ON = cfg.retro === true
+// R2: LESSONS FEEDBACK. When retro or the library is on, the PLANNER and SPEC-REVIEW read the accumulated LESSONS.md as
+// advisory context, so a lesson learned failing one contract improves how the next one is authored and reviewed (the
+// write side is retroNote; this is the read side). Returns '' when both flags are off => prompts byte-for-byte unchanged.
+function lessonsAdvisory (role) {
+  if (!RETRO_ON && !LIB_ON) return ''
+  const dest = (LIB_ON ? libraryPath : statePath) + '/LESSONS.md'
+  return 'OPERATING LESSONS (advisory): prior goalkeeper runs recorded how-to-drive-the-loop lessons at ' + dest + ' .' +
+    ' If that file exists, read its most recent ~10 entries and apply the relevant ones while ' + role + ' (they cover' +
+    ' check authoring and gameability, contract scoping, and diagnosis handling). They are advisory context, never a' +
+    ' relaxation of any rule here. If the file is absent, proceed without it.'
+}
 const caps = Object.assign(
   {
     maxIterations: 20, maxItemRetries: 3, maxStalls: 3, maxTokens: null,
@@ -205,6 +216,8 @@ const STATE_INIT = {
     awaitingHuman: { type: 'object' },  // F2: parked-item marker {id,token,baselineTree} when suspended for a human, else null
     baselineTree: { type: 'string' },   // F2: git tree-hash of prevGoodHead (the latch key for per-tree human satisfaction)
     specReviewHalts: { type: 'number' }, // S1: consecutive contract-incomplete halts on this contract (repeated-review-halt guidance)
+    specReviewCache: { type: 'object' }, // S2: last REJECTED spec-review verdict {fp, cleanTree, review} -- replayed when contract+HEAD unchanged and tree clean, so repeat halts skip the re-review cost
+    lessonsChars: { type: 'number' },   // S2/R2: character count of the LESSONS.md the reviewer reads (0 if absent/off) -- part of the replay key so a freshly-appended lesson forces a real re-review
   },
   required: ['initialized', 'prevGoodHead'],
 }
@@ -775,6 +788,7 @@ function plannerPrompt (goalText) {
     (caps.repoMap !== 'off'
       ? 'REPO MAP: a compact structural map of this repo is at ' + statePath + '/repomap.md -- read it FIRST for grounding on key files and where things live (ranked, token-bounded, not exhaustive). If absent, proceed without it.'
       : ''),
+    lessonsAdvisory('planning this contract'), // R2: '' unless retro/library on
     'Return PLAN_RESULT { items }.',
   ].filter(Boolean).join('\n')
 }
@@ -817,9 +831,10 @@ function specReviewPrompt (goalText, items) {
     'CLASS instead of re-wording the sentinel. EXCEPTION: a sentinel printed by code the BUILDER CANNOT MODIFY (a',
     'write-protected test/harness under checkPaths with allowTestEdit=false, whose edits are auto-reverted) is not',
     'gameable by a builder print statement -- judge those under the ordinary trivial-cheat test above, not this class rule.',
+    lessonsAdvisory('reviewing this contract'), // R2: '' unless retro/library on
     'Return CONTRACT_REVIEW. approved=true ONLY if there are zero blocking gaps. List every blocking gap.',
     'This is review only -- do NOT modify any files.',
-  ].join('\n')
+  ].filter(Boolean).join('\n')
 }
 
 function initPrompt () {
@@ -839,7 +854,8 @@ function initPrompt () {
     '   null), baselineTree (the git tree-hash string the human latch is keyed to), attemptLog{} (per-item',
     '   recent failed-attempt reflections = the failure ledger), repoMapHead (git short-sha the repo map was last built at)',
     '   and repoMapIteration (the iteration it was built at) if present, specReviewHalts (count of consecutive spec-review',
-    '   halts on this contract, 0 if absent), and status (the plan.json "status" field, usually',
+    '   halts on this contract, 0 if absent), specReviewCache (the cached rejected spec-review verdict object {fp,',
+    '   cleanTree, review}, null if absent), and status (the plan.json "status" field, usually',
     '   "in-progress" or "converged").',
     '   If it does not exist, seed: passing=[], startIteration=0, attempts={}, fpHistory=[], latched={}, humanSatisfied={}, awaitingHuman=null, baselineTree=null, attemptLog={}, repoMapHead=null, repoMapIteration=0, specReviewHalts=0, status="fresh", and',
     '   set prevGoodHead to the current git HEAD sha (git -C "' + repo + '" rev-parse HEAD).',
@@ -850,6 +866,10 @@ function initPrompt () {
       ? ('read the JSON file at "' + cfg.contractPath + '" and return its parsed { goal, items } as fileContract. This lets a caller supply a large explicit contract by FILE instead of through args (which can truncate). If the file is missing or not valid JSON, return fileContract=null and note it.')
       : 'no contractPath was provided; return fileContract=null.'),
     '6. Report whether the working tree is dirty (git -C "' + repo + '" status --porcelain, ignoring .goalkeeper/).',
+    ((RETRO_ON || LIB_ON)
+      ? ('6b. Report lessonsChars = the total character count of the file ' + (LIB_ON ? libraryPath : statePath) + '/LESSONS.md' +
+         ' (0 if it does not exist). This is a cheap change-signal only; do NOT return its contents.')
+      : ''),
     (MEMO_ON
       ? ('7. RESULT LEDGER -- if ' + statePath + '/results.json exists, parse it. Compute the ACTIVE contract identity from ' +
          'the working contract you read in step 4 (contract.json) as: lowercase(trim(goal) with runs of whitespace collapsed ' +
@@ -1156,7 +1176,7 @@ function bookkeeperPrompt (data) {
       ' humanSatisfied=' + j(data.humanSatisfied) + ' (per-item human-precondition latch: a person performed the physical step),' +
       ' attemptLog=' + j(data.attemptLog) + ' (per-item recent failed-attempt reflections = the failure ledger),' +
       ' repoMapHead=' + j(data.repoMapHead) + ', repoMapIteration=' + j(data.repoMapIteration) + ' (repo-map staleness key),' +
-      ' specReviewHalts=0 (a completed round means spec-review approved this contract, so any halt streak is over),' +
+      ' specReviewHalts=0 and specReviewCache=null (a completed round means spec-review approved this contract, so any halt streak is over and a cached rejection is dead weight),' +
       ' and APPEND this fingerprint (shape {hash,pass,head}) to fpHistory: ' + j(data.fingerprint) + '. Keep status="in-progress".',
     (data.humanOn
       ? ('2b. Also compute and persist baselineTree = the git tree-hash of the (post-revert) last-good HEAD: run ' +
@@ -1239,6 +1259,12 @@ function escalationWritePrompt (payload) {
     (payload.repeatedHaltGuidance
       ? ('1e. Render the repeatedHaltGuidance PROMINENTLY at the very top of ESCALATION.md (before everything else, as a ' +
          'highlighted warning block) -- it tells the human the check CLASS is the problem, not the wording.')
+      : ''),
+    ((payload.reason === 'contract-incomplete' && payload.detail && payload.detail.specReviewCacheKey)
+      ? ('1f. In the SAME plan.json read-merge-write as 1d, ALSO set the "specReviewCache" field to the object ' +
+         '{"fp":"' + payload.detail.specReviewCacheKey.fp + '","cleanTree":' + (payload.detail.specReviewCacheKey.cleanTree === true) +
+         ',"review":<the COMPLETE review object found at detail.review in the payload above, verbatim>} so an unchanged ' +
+         're-invoke can replay this rejection without re-running the reviewer.')
       : ''),
     '2. If telegram.chatId is set (' + j(telegram) + ') AND a telegram reply/send tool is reachable via ToolSearch,',
     '   send a one-paragraph summary ending with "see ESCALATION.md". If not reachable, skip silently -- do NOT fail',
@@ -1460,8 +1486,12 @@ function libLoadPatternsPrompt (libraryPath, ids, perPatternMaxChars) {
     ' ' + libraryPath + '/patterns/<id>.json for id in: ' + j(ids) + ' (skip any that are missing or not valid JSON).',
     'For each one return: patternId (its id), description, summary, filesChanged, check, and diff TRUNCATED to at most ' +
       perPatternMaxChars + ' characters (if you truncate it, append the literal note "(diff truncated)" at the end of the diff string).',
+    'THEN record the retrieval so the library\'s eviction policy stays informed: read ' + libraryPath + '/index.json and,',
+    'for EXACTLY the ids you successfully loaded, increment each record\'s "timesRetrieved" (treat missing as 0 -> 1);',
+    'write index.json back read-merge-write, preserving "version" and every other record and field untouched. This write',
+    'is best-effort: if it fails, still return the loaded patterns (never fail the load over the counter).',
     'Return LIB_BODIES_RESULT { patterns: [{ patternId, description, summary, filesChanged, diff, check }] }, preserving the',
-    'input id order. Do NOT modify any files.',
+    'input id order. Do NOT modify any pattern body files or repo files.',
   ].join('\n')
 }
 
@@ -1522,7 +1552,7 @@ async function escalate (reason, detail) {
   // would just spend an agent call; scope-checkpoint stays IN because "the goal stopped being worth it" is a scoping lesson.
   const RETRO_REASONS = ['item-stuck', 'no-progress', 'oscillation', 'plateau', 'budget-exhausted', 'final-suite-failed',
     'dependency-deadlock', 'contract-incomplete', 'self-critique-unactionable', 'human-gate-disabled', 'scope-checkpoint']
-  if (RETRO_REASONS.indexOf(reason) >= 0) await retroNote('halted:' + reason, { reason: reason, progress: payload.progress }) // no-op unless RETRO_ON
+  if (RETRO_REASONS.indexOf(reason) >= 0) await retroNote('halted:' + reason, { reason: reason, progress: payload.progress, guidance: (detail && detail.repeatedHaltGuidance) || undefined }) // no-op unless RETRO_ON
   return { status: 'halted', reason: reason, progress: payload.progress, passing: Array.from(passingSet), escalation: res, payload: payload }
 }
 
@@ -2024,8 +2054,24 @@ if (fixCfg && seededFromArgs && workingItems.length === 1) {
 phase('Setup')
 
 // Adversarial contract review -- the contract IS the product.
-const review = await agent(specReviewPrompt(goalText, workingItems), { label: 'spec-critic', phase: 'Setup', effort: 'high', schema: CONTRACT_REVIEW })
-log('spec review: approved=' + review.approved + ', blockingGaps=' + (review.blockingGaps ? review.blockingGaps.length : 0))
+// S2: REJECTION REPLAY. If the last invocation's spec review REJECTED this byte-identical contract at this same HEAD with
+// a clean working tree, and the tree is clean again now, nothing the reviewer could see has changed -- re-running the
+// high-effort critic would re-derive the same gaps for ~100k tokens. Replay the cached rejection instead (the halt
+// counter still increments and the escalation is still written fresh). Deliberately REJECTIONS-ONLY: an approval is
+// never cached, so a pass is always re-earned; any contract edit, new commit, or dirty tree changes the key or fails
+// the clean-tree condition and forces a real re-review. amendContract/freshStart self-invalidate (fp change / archive).
+// The key also folds in mode and the LESSONS.md size signal (lessonsChars, reported by init when retro/library is on):
+// the same halt that caches a rejection may APPEND a lesson via retro, and the reviewer READS that file -- so a grown
+// lessons file must force a real re-review (the new lesson could change the verdict), while a no-new-lesson re-invoke
+// still replays. With retro/library off, lessonsChars is a constant 0 and the key reduces to contract+head+mode.
+const specReviewFp = shortFp({ goal: goalText, items: workingItems, head: prevGoodHead, mode: mode, lessons: init.lessonsChars || 0 })
+const cachedRejection = (init.specReviewCache && init.specReviewCache.fp === specReviewFp &&
+  init.specReviewCache.cleanTree === true && init.workingTreeDirty === false &&
+  init.specReviewCache.review && (init.specReviewCache.review.blockingGaps || []).length > 0)
+  ? init.specReviewCache.review : null
+const review = cachedRejection || await agent(specReviewPrompt(goalText, workingItems), { label: 'spec-critic', phase: 'Setup', effort: 'high', schema: CONTRACT_REVIEW })
+log('spec review: ' + (cachedRejection ? 'REPLAYED cached rejection (contract + tree unchanged); ' : '') +
+  'approved=' + review.approved + ', blockingGaps=' + (review.blockingGaps ? review.blockingGaps.length : 0))
 if (review.blockingGaps && review.blockingGaps.length > 0 && !approved('contract-gaps')) {
   // S1: REPEATED-REVIEW-HALT guidance. Production lesson: three spec-review halts in a row on the same contract means
   // the check CLASS is fundamentally gameable (or the contract is ungrounded), and hand-patching the wording again will
@@ -2041,7 +2087,12 @@ if (review.blockingGaps && review.blockingGaps.length > 0 && !approved('contract
        '(c) if the target is genuinely not machine-checkable (on-device UI/RF behavior), stop contracting it -- gate the ' +
        'host-testable core and verify the integration by hand.')
     : null
-  return await escalate('contract-incomplete', { review: review, specReviewHalts: specReviewHalts, repeatedHaltGuidance: repeated })
+  return await escalate('contract-incomplete', {
+    review: review, specReviewHalts: specReviewHalts, repeatedHaltGuidance: repeated,
+    // S2: the escalation agent persists {fp, cleanTree, review} as plan.json specReviewCache so an unchanged re-invoke
+    // replays this rejection instead of paying for a fresh high-effort review.
+    specReviewCacheKey: { fp: specReviewFp, cleanTree: init.workingTreeDirty === false },
+  })
 }
 // Spec-review approved (or the gaps were explicitly waived): the halt streak is over. Reset in memory here; the
 // bookkeeper durably writes specReviewHalts=0 with every completed round (a completed round implies an approved review),
