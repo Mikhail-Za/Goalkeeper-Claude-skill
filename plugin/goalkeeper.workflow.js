@@ -99,6 +99,23 @@ const HUMAN_ON = (cfg.humanGate === true) || (cfg.approveToken === true)
 // existing .filter(Boolean) drops it), the build memo key is untouched, and NO file is read or written.
 const LIB_ON = typeof cfg.libraryPath === 'string' && cfg.libraryPath.trim().length > 0
 const libraryPath = LIB_ON ? cfg.libraryPath.trim() : null
+// D1: HUMAN-PROVEN DIAGNOSIS (opt-in, default OFF). The production-proven driving pattern: the human does the decisive
+// diagnosis, then hands goalkeeper the proven finding so it EXECUTES the mechanical fix instead of re-theorizing (its
+// weak spot). cfg.diagnosis = a string, or { text, itemId } to scope it to one item. When set, the text is injected into
+// every (matching) builder prompt as a trust-this block AND re-planning is locked (maxReplans forced to 0 below), because
+// a run driven by a proven diagnosis must never wander off re-diagnosing. With it unset, DIAG_ON===false and every prompt
+// is byte-for-byte unchanged.
+const _diagRaw = cfg.diagnosis
+const diag = (typeof _diagRaw === 'string' && _diagRaw.trim().length > 0)
+  ? { text: _diagRaw.trim(), itemId: null }
+  : (_diagRaw && typeof _diagRaw === 'object' && typeof _diagRaw.text === 'string' && _diagRaw.text.trim().length > 0)
+    ? { text: _diagRaw.text.trim(), itemId: _diagRaw.itemId || null }
+    : null
+const DIAG_ON = diag !== null
+// R1: AUTO-RETRO (opt-in, default OFF). On converge or escalate, one low-effort agent appends a short dated "what this
+// run taught about DRIVING goalkeeper" note to LESSONS.md (at libraryPath when LIB_ON, else the repo state dir), so the
+// operating playbook grows from real runs instead of manual folding. Best-effort; never affects the run outcome.
+const RETRO_ON = cfg.retro === true
 const caps = Object.assign(
   {
     maxIterations: 20, maxItemRetries: 3, maxStalls: 3, maxTokens: null,
@@ -118,6 +135,9 @@ const caps = Object.assign(
   },
   cfg.caps || {}
 )
+// D1: a human-proven diagnosis LOCKS re-planning. The whole point of handing in a diagnosis is "execute, do not
+// re-theorize"; production runs showed goalkeeper re-diagnosing wrongly when left free to re-plan around a known fix.
+if (DIAG_ON && caps.maxReplans !== 0) { caps.maxReplans = 0; log('diagnosis provided -> maxReplans forced to 0 (execute the proven fix; no re-planning)') }
 const roundsThisRun = (autonomy === 'leash') ? (cfg.runRounds || 1) : caps.maxIterations
 // budget.spent() is the SHARED token meter for the whole turn, not just this run. Snapshot it at
 // run start so caps.maxTokens bounds THIS run's spend (the delta), not the cumulative session total.
@@ -184,6 +204,7 @@ const STATE_INIT = {
     humanSatisfied: { type: 'object' }, // F2: per-item human-precondition latch {<itemId>:{tree,runId,satisfied,at}}
     awaitingHuman: { type: 'object' },  // F2: parked-item marker {id,token,baselineTree} when suspended for a human, else null
     baselineTree: { type: 'string' },   // F2: git tree-hash of prevGoodHead (the latch key for per-tree human satisfaction)
+    specReviewHalts: { type: 'number' }, // S1: consecutive contract-incomplete halts on this contract (repeated-review-halt guidance)
   },
   required: ['initialized', 'prevGoodHead'],
 }
@@ -614,6 +635,10 @@ function validMemo (role, r) {
 // Per-item override item.candidates wins when numeric. With candidatesHardOnly, the FIRST try of an item (retries==0,
 // not an explicit per-item request) stays single-builder so only retries fan out.
 function candidatesFor (item) {
+  // D1: a human-proven diagnosis and candidate DIVERSITY are contradictory instructions ("execute exactly this fix" vs
+  // "explore a distinct approach"), so an item the diagnosis applies to always gets the single-builder path. This also
+  // beats a per-item candidates override, for the same reason maxReplans is forced to 0.
+  if (DIAG_ON && (!diag.itemId || diag.itemId === item.id)) return 1
   let n = (typeof item.candidates === 'number') ? item.candidates : caps.candidates
   n = Math.max(1, Math.min(n, caps.maxCandidates))
   if (n <= 1) return 1
@@ -781,6 +806,17 @@ function specReviewPrompt (goalText, items) {
     'fake (multiple/edge inputs, properties, round-trips, real error paths). MECHANICAL-ONLY: prefer objective pass/fail or',
     'numeric checks; a "judge"/subjective check with a vague "looks good" rubric is a blocking gap unless its rubric is',
     'concrete and falsifiable.',
+    'LOG/SERIAL SENTINELS ARE ALWAYS GAMEABLE (a class rule, not case-by-case): a check that greps a log, serial capture,',
+    'or console output for a LITERAL STRING is satisfiable by one hardcoded print statement with ZERO real work, no matter',
+    'how specific the string is -- so a more-specific sentinel string is NEVER an acceptable fix for this gap. Such a check',
+    'is a blocking gap UNLESS it is paired with a companion gate a print cannot fake, e.g.: (a) a LINKED-SYMBOL assertion',
+    '(run nm/objdump on the built binary for a symbol only the real implementation introduces -- and note the contract must',
+    'have verified that symbol is ABSENT from the current pre-work build, or the gate proves nothing), (b) a behavioral',
+    'host test that exercises the real logic, or (c) a numeric/property assertion derived from real behavior. When you flag',
+    'this gap, SAY so in these terms (sentinel-plus-symbol-gate or behavioral companion), so the author fixes the check',
+    'CLASS instead of re-wording the sentinel. EXCEPTION: a sentinel printed by code the BUILDER CANNOT MODIFY (a',
+    'write-protected test/harness under checkPaths with allowTestEdit=false, whose edits are auto-reverted) is not',
+    'gameable by a builder print statement -- judge those under the ordinary trivial-cheat test above, not this class rule.',
     'Return CONTRACT_REVIEW. approved=true ONLY if there are zero blocking gaps. List every blocking gap.',
     'This is review only -- do NOT modify any files.',
   ].join('\n')
@@ -793,16 +829,19 @@ function initPrompt () {
     '1. Ensure directory ' + statePath + ' exists.',
     '2. Ensure git IGNORES the state directory so it never pollutes "git status" or gets committed: append a line',
     '   ".goalkeeper/" to ' + repo + '/.git/info/exclude if not already present (create that file if needed).',
-    '3. RUNTIME state -- if ' + statePath + '/plan.json exists, read it and return: passing[] item ids, prevGoodHead,',
+    '3. RUNTIME state -- if ' + statePath + '/plan.json exists, read it and return: passing[] item ids, prevGoodHead',
+    '   (DEFENSIVE: if the file exists but prevGoodHead is missing/empty, derive it from git -C "' + repo + '" rev-parse HEAD',
+    '   -- never return an empty prevGoodHead; other missing fields default to the fresh-seed values below),',
     '   iteration as startIteration, attempts{} (per-item failed-attempt counts), fpHistory[] ({hash,pass,head} per round),',
     '   latched{} (per-nondeterministic-item: the git tree-hash at which its check last passed),',
     '   humanSatisfied{} (per-item human-precondition latch: the record proving a person performed the required physical',
     '   action), awaitingHuman (the parked-item marker {id,token,baselineTree} when the run is suspended for a human, else',
     '   null), baselineTree (the git tree-hash string the human latch is keyed to), attemptLog{} (per-item',
     '   recent failed-attempt reflections = the failure ledger), repoMapHead (git short-sha the repo map was last built at)',
-    '   and repoMapIteration (the iteration it was built at) if present, and status (the plan.json "status" field, usually',
+    '   and repoMapIteration (the iteration it was built at) if present, specReviewHalts (count of consecutive spec-review',
+    '   halts on this contract, 0 if absent), and status (the plan.json "status" field, usually',
     '   "in-progress" or "converged").',
-    '   If it does not exist, seed: passing=[], startIteration=0, attempts={}, fpHistory=[], latched={}, humanSatisfied={}, awaitingHuman=null, baselineTree=null, attemptLog={}, repoMapHead=null, repoMapIteration=0, status="fresh", and',
+    '   If it does not exist, seed: passing=[], startIteration=0, attempts={}, fpHistory=[], latched={}, humanSatisfied={}, awaitingHuman=null, baselineTree=null, attemptLog={}, repoMapHead=null, repoMapIteration=0, specReviewHalts=0, status="fresh", and',
     '   set prevGoodHead to the current git HEAD sha (git -C "' + repo + '" rev-parse HEAD).',
     '4. WORKING CONTRACT -- if ' + statePath + '/contract.json exists, read it and return its items[], goal, replanCount,',
     '   critiqueRounds. If it does not exist, return items=[], goal="", replanCount=0, critiqueRounds=0.',
@@ -870,16 +909,24 @@ function builderPrompt (item, goalText, priorAttempts, attemptNum, maxRetries, p
          priorAttempts.map(function (a) { return '  - round ' + a.iteration + ' (' + a.outcome + '): ' + (a.reflection || '') }).join('\n'))
       : 'No prior failed attempts on this item yet.'),
     (fixCfg ? 'NOTE: a prior attempt tagged "initial-red" is the command\'s CURRENT failing output (the starting signal to fix), not a wrong approach you previously took.' : ''),
+    renderDiagnosis(item),
     'Further per-round detail is in ' + statePath + '/worklog.md.',
     (caps.repoMap !== 'off'
       ? 'REPO MAP: a compact structural map of this repo is at ' + statePath + '/repomap.md -- read it FIRST for grounding on where things live (key files + top-level symbols, ranked, token-bounded). It is a guide, not exhaustive; open the actual files you need. If absent, proceed without it.'
       : ''),
     (LIB_ON && provenPatterns && provenPatterns.length ? renderProvenPatterns(provenPatterns) : ''),
     ((attemptNum && maxRetries && attemptNum >= (maxRetries - 1))
-      ? ('LAST ATTEMPT: you have already failed this item ' + attemptNum + ' time(s); after this it is ESCALATED to a human. ' +
-         'Do NOT iterate on the same approach -- take a FUNDAMENTALLY different one. If you are genuinely blocked, set ' +
-         'blocked=true with a precise, specific blockerReason (exactly what is missing or impossible) -- that is more useful ' +
-         'to the human than another failed guess.')
+      ? ((DIAG_ON && (!diag.itemId || diag.itemId === item.id))
+        // D1: under a human-proven diagnosis the last-retry pressure must NOT push the builder off the diagnosis --
+        // "fundamentally different approach" is exactly the re-theorizing the diagnosis exists to prevent.
+        ? ('LAST ATTEMPT: you have already failed this item ' + attemptNum + ' time(s); after this it is ESCALATED to a human. ' +
+           'The HUMAN-PROVEN DIAGNOSIS above still stands: do NOT abandon it for a different approach. Either apply it more ' +
+           'precisely than the prior attempts did, or set blocked=true with a blockerReason quoting exactly what contradicts ' +
+           'the diagnosis -- that is the signal the human needs.')
+        : ('LAST ATTEMPT: you have already failed this item ' + attemptNum + ' time(s); after this it is ESCALATED to a human. ' +
+           'Do NOT iterate on the same approach -- take a FUNDAMENTALLY different one. If you are genuinely blocked, set ' +
+           'blocked=true with a precise, specific blockerReason (exactly what is missing or impossible) -- that is more useful ' +
+           'to the human than another failed guess.'))
       : ''),
     CHECK_SEMANTICS_NOTE,
     'WHEN DONE: run the item check yourself (honoring the semantics above), then commit ONLY your changes with message "goalkeeper: ' + item.id + '".',
@@ -932,6 +979,7 @@ function candidateBuilderPrompt (item, goalText, priorAttempts, attemptNum, maxR
          'precise, specific blockerReason -- that is more useful than another failed guess.')
       : ''),
     (LIB_ON && provenPatterns && provenPatterns.length ? renderProvenPatterns(provenPatterns) : ''),
+    renderDiagnosis(item),
     CHECK_SEMANTICS_NOTE,
     'YOUR DISTINCT APPROACH (candidate ' + candidateIndex + ' of ' + n + ', exploring a DISTINCT approach from the others): ' + hint,
     'WHEN DONE: run the item check yourself (honoring the semantics above), then commit ONLY your changes with the commit',
@@ -1108,6 +1156,7 @@ function bookkeeperPrompt (data) {
       ' humanSatisfied=' + j(data.humanSatisfied) + ' (per-item human-precondition latch: a person performed the physical step),' +
       ' attemptLog=' + j(data.attemptLog) + ' (per-item recent failed-attempt reflections = the failure ledger),' +
       ' repoMapHead=' + j(data.repoMapHead) + ', repoMapIteration=' + j(data.repoMapIteration) + ' (repo-map staleness key),' +
+      ' specReviewHalts=0 (a completed round means spec-review approved this contract, so any halt streak is over),' +
       ' and APPEND this fingerprint (shape {hash,pass,head}) to fpHistory: ' + j(data.fingerprint) + '. Keep status="in-progress".',
     (data.humanOn
       ? ('2b. Also compute and persist baselineTree = the git tree-hash of the (post-revert) last-good HEAD: run ' +
@@ -1140,6 +1189,13 @@ function buildEscalationPayload (reason, detail) {
     blockingItem: item ? { id: item.id, description: item.description, check: item.check } : null,
     detail: detail || {},
     decisionNeeded: 'Choose how to unblock this run.',
+    // S1: surface the consecutive spec-review-halt count + (at >=3) the pointed check-class guidance, so the human sees
+    // "stop re-wording the sentinel" instead of a third identical halt. For every other escalation reason, fall back to
+    // the CURRENT in-memory counter (so an approve-then-halt-before-any-round still durably persists the reset-to-0 via
+    // clause 1d); before the counter var initializes (the earliest init-failed escalate) it is undefined and drops.
+    specReviewHalts: (detail && typeof detail.specReviewHalts === 'number') ? detail.specReviewHalts
+      : ((typeof specReviewHalts === 'number') ? specReviewHalts : undefined),
+    repeatedHaltGuidance: (detail && detail.repeatedHaltGuidance) || undefined,
     // C2: when TOKEN_ON, surface a durable token + a file-based resolution lever; otherwise the payload is byte-for-byte as before.
     token: TOKEN_ON ? mintToken(reason, detail) : undefined,
     options: [
@@ -1170,6 +1226,19 @@ function escalationWritePrompt (payload) {
     (TOKEN_ON && payload.token
       ? ('1c. ALSO record the outstanding token in plan.json: read ' + statePath + '/plan.json, set its "activeToken" ' +
          'field to "' + payload.token + '", and write it back (read-merge-write; keep every other field unchanged).')
+      : ''),
+    (typeof payload.specReviewHalts === 'number'
+      ? ('1d. ALSO persist the spec-review halt counter into ' + statePath + '/plan.json: if plan.json EXISTS, read it, set ' +
+         'its "specReviewHalts" field to ' + payload.specReviewHalts + ', and write it back (read-merge-write; keep every ' +
+         'other field unchanged). If it does NOT exist, create it with the COMPLETE fresh runtime seed so a later init ' +
+         'never reads a partial file: {"status":"fresh","passing":[],"iteration":0,"attempts":{},"fpHistory":[],' +
+         '"latched":{},"humanSatisfied":{},"awaitingHuman":null,"baselineTree":null,"attemptLog":{},"repoMapHead":null,' +
+         '"repoMapIteration":0,"prevGoodHead":"<the output of git -C \'' + repo + '\' rev-parse HEAD>","specReviewHalts":' +
+         payload.specReviewHalts + '}.')
+      : ''),
+    (payload.repeatedHaltGuidance
+      ? ('1e. Render the repeatedHaltGuidance PROMINENTLY at the very top of ESCALATION.md (before everything else, as a ' +
+         'highlighted warning block) -- it tells the human the check CLASS is the problem, not the wording.')
       : ''),
     '2. If telegram.chatId is set (' + j(telegram) + ') AND a telegram reply/send tool is reachable via ToolSearch,',
     '   send a one-paragraph summary ending with "see ESCALATION.md". If not reachable, skip silently -- do NOT fail',
@@ -1399,6 +1468,19 @@ function libLoadPatternsPrompt (libraryPath, ids, perPatternMaxChars) {
 // PURE string formatter: render loaded patterns as a clearly-ADVISORY block for the builder. It is framed so it can never
 // read as relaxing a rule: these merely PASSED an independent verifier on SIMILAR problems in OTHER repos; they are a
 // starting point, NOT a guarantee; the verifier WILL re-check from scratch; adapt, do not blind-paste.
+// D1: render the human-proven diagnosis block for a builder. Empty string unless DIAG_ON and this item is in scope
+// (diag.itemId scopes it to one item; null = applies to every item). Deliberately placed AFTER the failure ledger in the
+// prompt so it reads as the operator's standing instruction, and it explicitly overrides the "fundamentally different
+// approach" last-retry pressure: a proven diagnosis is executed, not second-guessed.
+function renderDiagnosis (item) {
+  if (!DIAG_ON || (diag.itemId && diag.itemId !== item.id)) return ''
+  return 'HUMAN-PROVEN DIAGNOSIS (the operator already did the decisive diagnosis; TRUST it and execute the mechanical fix it calls for):\n' +
+    '  ' + diag.text + '\n' +
+    'Do NOT re-diagnose, do NOT take a "fundamentally different approach" that contradicts this diagnosis, and do NOT request ' +
+    'a re-plan around it (re-planning is locked for this run). If the diagnosis is impossible to apply as stated, set ' +
+    'blocked=true with a precise blockerReason quoting exactly what contradicts it -- that is the signal the human needs.'
+}
+
 function renderProvenPatterns (patterns) {
   const lines = [
     'PROVEN PATTERNS (advisory -- NOT a relaxation of any rule):',
@@ -1435,6 +1517,12 @@ async function escalate (reason, detail) {
   } catch (e) {
     res = { written: false, note: 'escalation agent failed: ' + String(e) }
   }
+  // R1: retro only on LESSON-WORTHY terminal halts. Administrative leash pauses (replan/self-critique batch boundaries)
+  // and infra failures (persist/init/planning/contract-lost/mismatch/unreadable) teach nothing about DRIVING the loop and
+  // would just spend an agent call; scope-checkpoint stays IN because "the goal stopped being worth it" is a scoping lesson.
+  const RETRO_REASONS = ['item-stuck', 'no-progress', 'oscillation', 'plateau', 'budget-exhausted', 'final-suite-failed',
+    'dependency-deadlock', 'contract-incomplete', 'self-critique-unactionable', 'human-gate-disabled', 'scope-checkpoint']
+  if (RETRO_REASONS.indexOf(reason) >= 0) await retroNote('halted:' + reason, { reason: reason, progress: payload.progress }) // no-op unless RETRO_ON
   return { status: 'halted', reason: reason, progress: payload.progress, passing: Array.from(passingSet), escalation: res, payload: payload }
 }
 
@@ -1471,6 +1559,39 @@ async function persistContract (counters) {
     const r = await agent(persistContractPrompt(workingItems, goalText, counters), { label: 'persist-contract', phase: 'Plan', effort: 'low', schema: PERSIST_RESULT })
     return { ok: !!(r && r.persisted) }
   } catch (e) { return { ok: false, error: String(e) } }
+}
+
+// R1: AUTO-RETRO (opt-in via cfg.retro). One low-effort agent appends a short dated "how goalkeeper was DRIVEN" lesson
+// to LESSONS.md on a terminal outcome (converge or a lesson-worthy halt), so the operating playbook grows from real runs.
+// The lesson is about DRIVING the loop (check authoring, contract scoping, diagnosis handling), NOT the code built.
+// Best-effort and outcome-neutral: it runs after the outcome is decided and a failure here only logs. Known limit: with
+// a shared libraryPath, two concurrent runs in different repos append via read-append-write (not atomic O_APPEND), so a
+// simultaneous append can lose one line -- outcome-neutral and rare enough to accept.
+function retroPrompt (kind, extra) {
+  const dest = (LIB_ON ? libraryPath : statePath) + '/LESSONS.md'
+  return [
+    'Append ONE short retro entry to ' + dest + ' about how goalkeeper was DRIVEN this run (outcome: ' + kind + ').',
+    'Sources: read ' + statePath + '/worklog.md if present, plus ' +
+      (kind === 'converged' ? (statePath + '/REPORT.md') : (statePath + '/ESCALATION.md')) + ' if present.' +
+      (extra ? (' Run context: ' + j(extra)) : ''),
+    'The entry must be about OPERATING the loop, useful on a FUTURE run in ANY repo: check authoring (gameable vs',
+    'behavioral, symbol gates), contract scoping (host-testable vs device-integration), diagnosis handling, retry/replan',
+    'dynamics. NOT a summary of the feature that was built, NOT repo-specific trivia.',
+    'Format: get today\'s date from the system (e.g. `date +%F` or PowerShell Get-Date), then append EXACTLY one entry:',
+    '  - <YYYY-MM-DD> [' + kind + '] <1-3 sentence lesson>',
+    'Create ' + dest + ' with the single header line "# Goalkeeper lessons (auto-retro)" if it does not exist.',
+    'APPEND-ONLY: never rewrite, reorder, or delete existing entries.',
+    'HIGH BAR: if this run teaches nothing a competent operator does not already know (e.g. a trivial contract that',
+    'converged first try with no friction), append NOTHING and return persisted=false. A skipped entry is the correct',
+    'output for an uneventful run.',
+    'Return PERSIST_RESULT { persisted: <true only if you appended> }.',
+  ].join('\n')
+}
+async function retroNote (kind, extra) {
+  if (!RETRO_ON) return
+  try {
+    await agent(retroPrompt(kind, extra), { label: 'retro:' + kind, phase: (kind === 'converged' ? 'Review' : 'Escalate'), effort: 'low', schema: PERSIST_RESULT })
+  } catch (e) { log('retro failed (non-fatal): ' + String(e)) }
 }
 
 // On convergence: write the completion report (the success analog of ESCALATION.md) AND delete any now-stale halt
@@ -1784,6 +1905,10 @@ var baselineTree = init.baselineTree || null // F2: git tree-hash of prevGoodHea
 // F2: a stable id for THIS run, for the 'per-run' human-rearm escape hatch. Deterministic (no clock/RNG): derived from the
 // run's starting coordinates so it round-trips on resume of the SAME parked run but differs once the run actually advances.
 const runId = fnv1a(stableStringify({ start: init.startIteration || 0, head: init.prevGoodHead || '', passing: (init.passing || []).slice().sort() }))
+// S1: consecutive contract-incomplete halts on this same contract (round-trips via plan.json; persisted by the escalation
+// agent, so a degraded escalation-write can under-count by one -- acceptable, it self-corrects on the next persisted halt).
+// An explicit amendContract is a NEW contract in spirit, so the streak (and its "stop re-wording" premise) resets with it.
+var specReviewHalts = cfg.amendContract ? 0 : (init.specReviewHalts || 0)
 var attemptLog = Object.assign({}, init.attemptLog || {}) // per-item recent failed-attempt reflections (the failure ledger)
 ;(cfg.resetAttempts || []).forEach(function (id) { delete attemptLog[id] }) // a human attempt-reset clears the ledger too, so stale "do not repeat" guidance cannot contradict the human's fix
 var resultLedger = (MEMO_ON && init.resultLedger) ? init.resultLedger : {} // C1: replayable per-call results (empty unless MEMO_ON + contractId matched at init)
@@ -1902,8 +2027,26 @@ phase('Setup')
 const review = await agent(specReviewPrompt(goalText, workingItems), { label: 'spec-critic', phase: 'Setup', effort: 'high', schema: CONTRACT_REVIEW })
 log('spec review: approved=' + review.approved + ', blockingGaps=' + (review.blockingGaps ? review.blockingGaps.length : 0))
 if (review.blockingGaps && review.blockingGaps.length > 0 && !approved('contract-gaps')) {
-  return await escalate('contract-incomplete', { review: review })
+  // S1: REPEATED-REVIEW-HALT guidance. Production lesson: three spec-review halts in a row on the same contract means
+  // the check CLASS is fundamentally gameable (or the contract is ungrounded), and hand-patching the wording again will
+  // just buy a fourth halt. The counter round-trips via plan.json (persisted by the escalation agent), so it survives
+  // resume/re-invoke on the same contract identity; it resets once spec-review approves.
+  specReviewHalts += 1
+  const repeated = specReviewHalts >= 3
+    ? ('REPEATED SPEC-REVIEW HALT #' + specReviewHalts + ' ON THIS CONTRACT. Stop re-wording the check; the check CLASS is ' +
+       'the problem. Do one of: (a) pair the sentinel with a gate a cheat cannot fake -- a linked-symbol assertion ' +
+       '(nm/objdump on the built binary for a symbol only the real work introduces, verified ABSENT in the current build ' +
+       'first) or a behavioral host test; (b) READ THE ACTUAL SOURCE and re-ground the contract in what the code really ' +
+       'does (a halt like this has previously exposed placeholder fallbacks satisfying the sentinel with zero work); or ' +
+       '(c) if the target is genuinely not machine-checkable (on-device UI/RF behavior), stop contracting it -- gate the ' +
+       'host-testable core and verify the integration by hand.')
+    : null
+  return await escalate('contract-incomplete', { review: review, specReviewHalts: specReviewHalts, repeatedHaltGuidance: repeated })
 }
+// Spec-review approved (or the gaps were explicitly waived): the halt streak is over. Reset in memory here; the
+// bookkeeper durably writes specReviewHalts=0 with every completed round (a completed round implies an approved review),
+// and a FRESH contract (freshStart/archive) starts from 0 because plan.json is archived with the old run.
+specReviewHalts = 0
 
 if (autonomy === 'leash' && !approved('start')) {
   return {
@@ -1964,6 +2107,7 @@ while (true) {
       // satisfied (no blocking weaknesses) -> converge: stamp status (authoritative), write the report, then return (fable step 4)
       const conv1 = await markConverged()
       const report1 = await closeOut({ head: finalV.headSha, iterations: iteration, weaknesses: crit.weaknesses || [] })
+      await retroNote('converged', { iterations: iteration, weaknesses: (crit.weaknesses || []).length }) // R1: no-op unless RETRO_ON
       return {
         status: 'converged', passing: Array.from(passingSet), head: finalV.headSha, iterations: iteration,
         weaknesses: crit.weaknesses || [], selfCritiqueSummary: crit.summary || '', report: report1, statusStamped: conv1.ok,
@@ -1974,6 +2118,7 @@ while (true) {
     // critique budget spent -> converge: stamp status (authoritative), write the report, then return (do not loop forever)
     const conv2 = await markConverged()
     const report2 = await closeOut({ head: finalV.headSha, iterations: iteration, weaknesses: [] })
+    await retroNote('converged', { iterations: iteration, critiqueBudgetSpent: true }) // R1: no-op unless RETRO_ON
     return {
       status: 'converged', passing: Array.from(passingSet), head: finalV.headSha, iterations: iteration,
       note: 'self-critique budget (maxCritiqueRounds=' + caps.maxCritiqueRounds + ') reached.', report: report2, statusStamped: conv2.ok,
@@ -2068,7 +2213,13 @@ while (true) {
     // ---- LIVING RE-PLAN: builder discovered the contract is wrong ----
     if (build.replanRequest && build.replanRequest.requested) {
       if (replanCount >= caps.maxReplans) {
-        return await escalate('replan-budget', { item: item, request: build.replanRequest, replanCount: replanCount })
+        // D1: when a diagnosis locked re-planning, say so in the escalation -- "replanCount 0/0" with no context reads
+        // like a misconfiguration, when it is actually the intended bounce-a-contradicted-diagnosis-to-the-human path.
+        return await escalate('replan-budget', {
+          item: item, request: build.replanRequest, replanCount: replanCount,
+          diagnosisLocked: DIAG_ON || undefined,
+          note: DIAG_ON ? 'Re-planning was locked to 0 because a human-proven diagnosis was supplied (cfg.diagnosis). A builder re-plan request under a diagnosis usually means the diagnosis is contradicted by reality -- re-check the diagnosis before granting a re-plan.' : undefined,
+        })
       }
       replanCount++
       workingItems = dedupeById(applyReplan(workingItems, build.replanRequest))

@@ -20,7 +20,7 @@ The defining risk this skill addresses is the opposite of laziness. An eager loo
 
 These are described in detail below; the contract is therefore mutable and durable, surviving resume.
 
-**Optional power features (all opt-in, all default-off).** Seven newer capabilities are gated behind flags and change nothing unless you turn them on. With no flags set, Goalkeeper behaves exactly as described above. They are: **best-of-N builders** (`caps.candidates` > 1: build N diverse candidate solutions for a hard item and let the deterministic contract pick the winner, no LLM judge); **step memoization** (`memoize: true`: call-granular crash-resume that skips re-running a builder/verifier call whose inputs are unchanged); a **durable approval token** (`approveToken: true`: resolve an escalation by writing a small file instead of re-invoking with args); a **repo map** (`caps.repoMap`: a cheap, token-bounded file/symbol map written once at setup to ground the planner and builder); a **verified pattern library** (`libraryPath`: bank every verifier-passed solution to a cross-repo store and inject the relevant ones as advisory context into future builds); a **durable physical human-in-the-loop gate** (`humanGate: true` + a check's `humanPrecondition`: suspend at zero compute until a person performs a required real-world action, then resume and verify); and a **CI-fix mode** (`fix: { command }`: point Goalkeeper at a red build/test command and it drives that exact command to green). Each is detailed in its own section below.
+**Optional power features (all opt-in, all default-off).** Nine newer capabilities are gated behind flags and change nothing unless you turn them on. With no flags set, Goalkeeper behaves exactly as described above. They are: **best-of-N builders** (`caps.candidates` > 1: build N diverse candidate solutions for a hard item and let the deterministic contract pick the winner, no LLM judge); **step memoization** (`memoize: true`: call-granular crash-resume that skips re-running a builder/verifier call whose inputs are unchanged); a **durable approval token** (`approveToken: true`: resolve an escalation by writing a small file instead of re-invoking with args); a **repo map** (`caps.repoMap`: a cheap, token-bounded file/symbol map written once at setup to ground the planner and builder); a **verified pattern library** (`libraryPath`: bank every verifier-passed solution to a cross-repo store and inject the relevant ones as advisory context into future builds); a **durable physical human-in-the-loop gate** (`humanGate: true` + a check's `humanPrecondition`: suspend at zero compute until a person performs a required real-world action, then resume and verify); a **CI-fix mode** (`fix: { command }`: point Goalkeeper at a red build/test command and it drives that exact command to green); a **human-proven diagnosis** (`diagnosis`: hand in a finding you already proved, and Goalkeeper executes the mechanical fix with re-planning locked instead of re-theorizing); and an **auto-retro** (`retro: true`: on converge or a lesson-worthy halt, append a short "how the loop was driven" lesson to a durable LESSONS.md). Each is detailed in its own section below.
 
 ## Architecture: three layers
 
@@ -32,7 +32,7 @@ These are described in detail below; the contract is therefore mutable and durab
 - `contract.json`: the **durable working contract**: `goal`, `items` (each with its `expectedOutput`, `check`, and `dependsOn`), and the two spent budgets `replanCount` and `critiqueRounds`. This is the contract the loop is *actually* building to right now, which can differ from what you first handed in (the planner may have generated it, self-critique may have appended items, a re-plan may have split items). It is written only by the planner/seed/re-plan/self-critique persist steps; the bookkeeper never touches it.
 - `worklog.md`: an append-only log of per-round reflections.
 
-Further files appear **only when the matching opt-in feature is on**, and are otherwise absent: `results.json` (the memoization ledger, `memoize: true`), `resolution.json` (a human-written durable-token resolution to consume, `approveToken: true` *or* `humanGate: true`), `repomap.md` (the generated, git-ignored repo map, `caps.repoMap` other than `'off'`), and `AWAITING-HUMAN.md` (a planned-pause notice written when a check's `humanPrecondition` suspends the run, `humanGate: true`). They are documented under "Optional power features". One piece of durable state lives **outside** `<repo>/.goalkeeper/`: the **verified pattern library** (`libraryPath`) is a cross-repo store at the path you pass, deliberately not under the target repo so a pattern learned in one repo can seed a build in another.
+Further files appear **only when the matching opt-in feature is on**, and are otherwise absent: `results.json` (the memoization ledger, `memoize: true`), `resolution.json` (a human-written durable-token resolution to consume, `approveToken: true` *or* `humanGate: true`), `repomap.md` (the generated, git-ignored repo map, `caps.repoMap` other than `'off'`), `AWAITING-HUMAN.md` (a planned-pause notice written when a check's `humanPrecondition` suspends the run, `humanGate: true`), and `LESSONS.md` (the auto-retro driving-lessons log, `retro: true`; written to `libraryPath` instead when the pattern library is on). They are documented under "Optional power features". One piece of durable state lives **outside** `<repo>/.goalkeeper/`: the **verified pattern library** (`libraryPath`) is a cross-repo store at the path you pass, deliberately not under the target repo so a pattern learned in one repo can seed a build in another.
 
 Splitting runtime state from the working contract is deliberate: the bookkeeper rewrites `plan.json` every round, but the contract must not be at risk of a bookkeeping overwrite, so it lives in its own file written only when it genuinely changes.
 
@@ -75,6 +75,8 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
   libraryPath: null,             // opt-in: absolute path to a cross-repo verified-pattern library. Every verifier-passed item is banked there, and patterns relevant to a new item are injected into the builder as advisory context. null = off
   humanGate: false,              // opt-in: honor a check's humanPrecondition. The run SUSPENDS at zero compute (status awaiting-human, costs no retry/iteration/no-progress) until a person performs the action and writes resolution.json {token, action:"ready"}, then resumes and verifies
   fix: null,                     // opt-in: CI-fix mode. { command, shell?, cwd?, env?, goal? } -> synthesize a one-item contract whose check is your red command and drive it to green (the captured red output seeds the first build). null = off
+  diagnosis: null,               // opt-in: a HUMAN-PROVEN diagnosis (string, or { text, itemId } to scope it to one item). Injected into every matching builder as a trust-this block; forces maxReplans=0 and single-builder for that item (execute the fix, never re-theorize). null = off
+  retro: null,                   // opt-in: true -> on converge or a lesson-worthy halt, a low-effort agent appends a dated "how the loop was driven" lesson to LESSONS.md (at libraryPath when set, else the state dir). Skips uneventful runs.
   denylist: ["git push","deploy","secrets","external-send"],  // forbidden actions, enforced regardless of mode
   telegram: { chatId: null },    // best-effort doorbell
   approvals: [],                 // leash: e.g. ["start"] to clear the pre-build gate; ["contract-gaps"] to proceed past blocking spec gaps
@@ -145,7 +147,7 @@ check: { type: "command", command: "./scripts/mesh-rx-check.sh", nondeterministi
 
 ## Optional power features (opt-in, default-off)
 
-Seven capabilities are gated behind flags. **None of them changes the default behavior:** with no flags set (`caps.candidates` 1, `memoize` false, `approveToken` false, `caps.repoMap` `'off'`, `libraryPath` null, `humanGate` false, `fix` null), Goalkeeper runs exactly as described in the rest of this document. Turn one on only when its trade-off is worth it.
+Nine capabilities are gated behind flags. **None of them changes the default behavior:** with no flags set (`caps.candidates` 1, `memoize` false, `approveToken` false, `caps.repoMap` `'off'`, `libraryPath` null, `humanGate` false, `fix` null, `diagnosis` null, `retro` off), Goalkeeper runs exactly as described in the rest of this document. Turn one on only when its trade-off is worth it.
 
 ### Best-of-N builders (`caps.candidates`, default 1)
 
@@ -246,6 +248,30 @@ Goalkeeper **synthesizes a one-item contract** whose single check *is* your comm
 
 CI-fix mode composes with the other features: it is just a contract the engine generated for you, so `libraryPath`, best-of-N, memoization, and the rest all apply. Re-invoking with the same `fix` **resumes** the in-progress run (the synthesized contract has a stable identity), so a fix that needs several rounds picks up where it left off rather than starting over.
 
+### Human-proven diagnosis (`diagnosis`, default off)
+
+Goalkeeper is strong at **executing** a mechanical fix against a real check; it is weaker at **high-level diagnosis** that needs human judgment or out-of-band observation (a second radio, a scope, a physical symptom). Left free, it will sometimes re-diagnose a problem you already solved and wander off the known fix. `diagnosis` encodes the production-proven driving pattern: you do the decisive diagnosis, then hand Goalkeeper the proven finding so it executes instead of re-theorizing.
+
+```js
+diagnosis: "TX corrupts because the status poll runs mid-reception; gate all diagnostic SPI reads to idle and never poll while a reception is latched"
+// or scope it to one item of a larger contract:
+diagnosis: { text: "...", itemId: "rx-clean" }
+```
+
+When set, three things happen for the matching item(s):
+
+- The text is injected into every builder attempt as a **HUMAN-PROVEN DIAGNOSIS** block: trust it, execute the mechanical fix it calls for, and if reality contradicts it, report `blocked` quoting exactly what contradicts it (that is the signal you need) rather than improvising.
+- **Re-planning is locked** (`caps.maxReplans` is forced to 0). A builder that requests a contract revision under a diagnosis escalates immediately, with the escalation noting that re-planning was locked because a diagnosis was supplied; that usually means the diagnosis is contradicted by reality, so re-check it before granting anything.
+- **Best-of-N is disabled for that item** (a diagnosis and "explore a distinct approach" are contradictory instructions, so the item always gets the single-builder path), and the usual last-retry "take a fundamentally different approach" pressure is replaced with "apply the diagnosis more precisely or report exactly what contradicts it".
+
+Reserve it for findings you actually proved. A guessed "diagnosis" disables exactly the machinery (re-planning, candidate diversity) that would recover from a wrong guess.
+
+### Auto-retro (`retro`, default off)
+
+`retro: true` makes Goalkeeper grow its own operating playbook. On a terminal outcome, one low-effort agent appends a single dated line to **`LESSONS.md`** (at `libraryPath` when the pattern library is on, so lessons are cross-repo; else in the repo's state dir) about how the loop was **driven**: check authoring (gameable vs behavioral, symbol gates), contract scoping (host-testable core vs device integration), diagnosis handling, retry dynamics. It is explicitly not a summary of the code that was built.
+
+It fires on **converge** and on **lesson-worthy halts** (item-stuck, no-progress, oscillation, plateau, budget-exhausted, final-suite-failed, dependency-deadlock, contract-incomplete, self-critique-unactionable, human-gate-disabled, scope-checkpoint). Administrative leash pauses and infrastructure failures do not spend the call. The retro agent holds a high bar: an uneventful run that converged first try with no friction appends nothing. The file is append-only and never affects a run's outcome.
+
 ## The workflow phases
 
 A run moves through five phases: **Plan -> Setup -> Loop -> Review -> Escalate**.
@@ -256,7 +282,9 @@ If you pass `{ goal }` with no `items[]`, a **PLANNER** agent decomposes the goa
 
 ### Setup (once)
 
-**Adversarial spec-review.** A critic agent attacks the contract itself, looking for gaps, ambiguity, unmeasurable checks, missing acceptance criteria, any `dependsOn` that points at a missing id, and any **environment-dependent check that does not carry `nondeterministic: true`** (treated as a blocking gap, because the loop would otherwise mistake an environmental miss for a code failure). It also **distrusts the check itself**: a check that is *wrong* (it would pass buggy code or fail correct code) or *cheat-able* (a trivial cheat could satisfy it without doing the real work) is a blocking contract gap, and the critic prefers mechanical pass/fail or numeric checks over subjective "looks good" rubrics. The contract *is* the product, and the scariest failure mode is converging flawlessly on the wrong target, so the contract gets reviewed before a single line is built. **Blocking gaps halt the run for human input** (`contract-incomplete`) rather than letting Goalkeeper build confidently toward something underspecified, unless you pass `approvals: ["contract-gaps"]`.
+**Adversarial spec-review.** A critic agent attacks the contract itself, looking for gaps, ambiguity, unmeasurable checks, missing acceptance criteria, any `dependsOn` that points at a missing id, and any **environment-dependent check that does not carry `nondeterministic: true`** (treated as a blocking gap, because the loop would otherwise mistake an environmental miss for a code failure). It also **distrusts the check itself**: a check that is *wrong* (it would pass buggy code or fail correct code) or *cheat-able* (a trivial cheat could satisfy it without doing the real work) is a blocking contract gap, and the critic prefers mechanical pass/fail or numeric checks over subjective "looks good" rubrics. One check class is treated as gameable **by rule**: a check that greps a log, serial capture, or console output for a **literal string** is satisfiable by one hardcoded print statement no matter how specific the string, so it blocks unless paired with a companion gate a print cannot fake (a linked-symbol assertion via `nm`/`objdump` on the built binary for a symbol only the real work introduces and which is absent from the pre-work build, a behavioral host test, or a numeric assertion). A sentinel printed by a write-protected harness the builder cannot modify is exempt. The contract *is* the product, and the scariest failure mode is converging flawlessly on the wrong target, so the contract gets reviewed before a single line is built. **Blocking gaps halt the run for human input** (`contract-incomplete`) rather than letting Goalkeeper build confidently toward something underspecified, unless you pass `approvals: ["contract-gaps"]`.
+
+**Repeated review halts get pointed guidance.** The number of consecutive `contract-incomplete` halts on the same contract is tracked durably (`specReviewHalts` in `plan.json`; it resets once the review approves, a round completes, or the contract is amended or fresh-started). From the **third** consecutive halt, the escalation leads with an explicit warning that the check **class** is the problem, not the wording: pair the sentinel with a symbol/behavioral gate, re-ground the contract by reading the actual source, or stop contracting a target that is not machine-checkable and gate the host-testable core instead. This encodes the production lesson that three review halts in a row means hand-patching the sentinel string will only buy a fourth.
 
 ### Loop (each round; advances at most one item)
 
@@ -325,7 +353,7 @@ Any non-converged stop writes **`ESCALATION.md`** to `<repo>/.goalkeeper/` and t
 - **`plateau`**: the passing-count did not increase for `maxPlateau` rounds (default 8); a best-of-N backstop for when HEAD advances but no new item passes.
 - **`budget-exhausted`**: `maxIterations`, the per-run token budget, or the shared session turn budget ran out; a `budgetKind` field (`"iteration"` / `"token"` / `"session"`) names which, and the per-run tokens spent and resume advice are tailored to it (a `"session"` halt needs a fresh turn, not a higher `maxTokens`). It points at `.goalkeeper/last-attempt-<itemId>.patch` for the in-flight item's discarded work.
 - **`final-suite-failed`**: all items passed individually but the final full-suite check did not.
-- **`contract-incomplete`**: the spec-review found blocking gaps in the contract.
+- **`contract-incomplete`**: the spec-review found blocking gaps in the contract. Consecutive halts are counted (`specReviewHalts`); from the third in a row the escalation opens with pointed check-class guidance (fix the check class, not the wording).
 - **`dependency-deadlock`**: items remain but none are eligible (a `dependsOn` is unsatisfiable / points at a missing id).
 - **`scope-checkpoint`**: the periodic scope check recommended stopping or asking the human.
 - **`replan`**: (leash only) a living re-plan revised the contract and paused for your review.

@@ -42,7 +42,7 @@ It also has a planning and self-correction layer built in (a "fable-mode" workfl
 
 ## Optional power features (opt-in, default-off)
 
-Seven extra capabilities are gated behind flags and **change nothing unless you turn them on**. With no flags set, Goalkeeper behaves exactly as described above.
+Nine extra capabilities are gated behind flags and **change nothing unless you turn them on**. With no flags set, Goalkeeper behaves exactly as described above.
 
 - **Best-of-N builders** (`caps.candidates` > 1, default 1). For a hard item, Goalkeeper builds **N diverse candidate solutions** and the **deterministic contract** (the independent verifier) picks the winner: there is **no LLM judge**. The candidates run **sequentially on the live repo** (each resets to last-good, builds a different approach guided by a diversity hint, is verified in place; the winning commit is promoted by cherry-pick), not in parallel worktrees. By default only **retries** fan out (`candidatesHardOnly`), so you pay the N-cost only where the loop is struggling, and N is capped (`maxCandidates`, default 6). If no candidate passes it is a normal failed round and item-stuck still bounds it. Cost: candidates multiply a round's build+verify token cost by up to N. A related `maxPlateau` stop (default 8) halts with reason `plateau` if the passing-count does not advance for that many rounds (a best-of-N backstop, since promoting a winner can move HEAD without a new item passing).
 - **Step memoization** (`memoize: true`, default false). Call-granular crash-resume: the expensive builder and verifier calls are keyed by a deterministic fingerprint of their inputs and their results stored in `.goalkeeper/results.json`, so a re-invocation returns a completed call's stored result instead of re-running it (no duplicate LLM spend). Invalidation is structural (a changed check or tree yields a different key), and a corrupt or missing ledger just degrades to recompute, so a stale result is never replayed.
@@ -51,6 +51,8 @@ Seven extra capabilities are gated behind flags and **change nothing unless you 
 - **Verified pattern library** (`libraryPath`, default off). Point Goalkeeper at a cross-repo directory and every verifier-passed solution is **banked** there (the committed diff, secret-scrubbed, source repo recorded by basename only), keyed by the item description. When a later run **in any repo** starts a similar item, the most relevant banked patterns are **retrieved semantically and injected into the builder** as a "PROVEN PATTERNS" advisory block, so you stop re-solving the same primitive from scratch. It is **advisory only**: the independent verifier and the anti-gaming inspection are untouched, so a pattern can never make a wrong solution pass. Dedup (append / update / replace-variant) is decided deterministically by the script, and the library lives **outside** any repo's `.goalkeeper/`, so `freshStart` and state resets never touch it.
 - **Durable physical human-in-the-loop** (`humanGate: true` + a check's `humanPrecondition`, default off). For a check that cannot pass until a **person does something physical** (move a radio to the next room, reseat an SD card, power-cycle a board), Goalkeeper **suspends at zero compute** (status `awaiting-human`, **not** a failure and **not** counted against any anti-spin budget), writes `AWAITING-HUMAN.md` with a one-time token, and waits. The person performs the action, writes `resolution.json { token, action: "ready" }`, and re-invokes; the run latches the human step (recording the authorizing token) and proceeds to verify. The latch is per-tree by default (re-asks only when the baseline tree changes). A `humanPrecondition` with the gate **off** escalates (`human-gate-disabled`) rather than being silently skipped.
 - **CI-fix mode** (`fix: { command }`, default off). Point Goalkeeper at a single **red command** (a failing build / test / lint) and it synthesizes a one-item contract whose check *is* that command, captures the failing output to seed the first build, and drives the real command to green, without letting the builder edit or stub the command itself. It composes with every other feature (it is just a generated contract), and re-invoking with the same `fix` resumes the in-progress run.
+- **Human-proven diagnosis** (`diagnosis`, default off). When you have already done the decisive diagnosis (the kind that needs human judgment or out-of-band observation), hand the proven finding in as a string (or `{ text, itemId }` to scope it to one item). The builder gets it as a trust-this block, **re-planning is locked** (`maxReplans` forced to 0) and that item stays single-builder, so the loop executes the mechanical fix instead of re-theorizing around it. A builder that finds reality contradicting the diagnosis reports `blocked` quoting the contradiction, which is exactly the signal you need.
+- **Auto-retro** (`retro: true`, default off). On converge or a lesson-worthy halt, one low-effort agent appends a dated one-line lesson about how the loop was **driven** (check authoring, contract scoping, diagnosis handling) to `LESSONS.md` (at `libraryPath` when the pattern library is on, so lessons accumulate cross-repo). Uneventful runs append nothing; administrative pauses and infra failures never spend the call.
 
 ### Turning the opt-in features on
 
@@ -113,6 +115,20 @@ When the loop reaches that item it suspends (status `awaiting-human`, no anti-sp
 fix: { command: "npm test -- auth.spec", shell: "pwsh" }   // synthesizes a one-item contract whose check IS this command
 ```
 Goalkeeper captures the failing output to seed the first build and drives the real command to exit 0, without letting the builder edit or stub the command itself. Re-invoking with the same `fix` resumes the in-progress run.
+
+**Human-proven diagnosis** (you did the diagnosis; the loop executes the fix without re-theorizing):
+```js
+diagnosis: "the status poll runs mid-reception and corrupts the frame; gate all diagnostic SPI reads to idle"
+// or scoped to one item of a larger contract:
+diagnosis: { text: "...", itemId: "rx-clean" }
+```
+The builder gets the finding as a trust-this block, re-planning is locked (`maxReplans` forced to 0), and the item stays single-builder. If reality contradicts the diagnosis, the builder reports `blocked` quoting the contradiction instead of improvising.
+
+**Auto-retro** (grow an operating playbook from real runs):
+```js
+retro: true          // appends to LESSONS.md at libraryPath (cross-repo) when the pattern library is on, else <repo>/.goalkeeper/LESSONS.md
+```
+One dated line per lesson-worthy outcome about how the loop was driven (check authoring, scoping, diagnosis handling). Uneventful runs append nothing.
 
 ---
 
@@ -196,6 +212,8 @@ Workflow({ scriptPath: "${CLAUDE_SKILL_DIR}/goalkeeper.workflow.js", args: {
   libraryPath: null,             // opt-in: cross-repo verified-pattern library (bank every pass, inject relevant patterns into later builds)
   humanGate: false,              // opt-in: suspend (awaiting-human) for a check's humanPrecondition until a person performs it and writes resolution.json
   fix: null,                     // opt-in: CI-fix mode. { command, shell?, cwd?, env? } -> drive that one red command to green
+  diagnosis: null,               // opt-in: a human-proven finding (string or { text, itemId }); builder executes it, re-planning locked
+  retro: false,                  // opt-in: append a dated driving-lesson line to LESSONS.md on converge / lesson-worthy halts
   denylist: ["git push","deploy","secrets","external-send"],
   freshStart: false              // optional: archive any existing goalkeeper state (even an unfinished run) and start this task on a clean slate
 }})
