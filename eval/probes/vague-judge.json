@@ -1,0 +1,27 @@
+{
+  "name": "vague-judge",
+  "tier": "A",
+  "dimension": "subjective-rubric",
+  "expect": "block",
+  "mustFlagAny": ["subjective", "vague", "rubric", "falsifiable"],
+  "notes": "The judge rubric asks whether the code looks clean and well organized, an unfalsifiable aesthetic judgment with no concrete criteria, so any refactor (including a cosmetic no-op) can be argued to pass.",
+  "repoFiles": {
+    "README.md": "# Config Parser\n\n`parser/config_parser.py` reads a small INI-like config format used by the CLI tool. The current implementation works but grew organically and mixes parsing, validation, and defaulting logic in a few long functions.\n",
+    "parser/config_parser.py": "def parse_config(text):\n    result = {}\n    section = None\n    for line in text.splitlines():\n        line = line.strip()\n        if not line or line.startswith('#'):\n            continue\n        if line.startswith('[') and line.endswith(']'):\n            section = line[1:-1]\n            result[section] = {}\n            continue\n        if '=' in line and section is not None:\n            key, _, value = line.partition('=')\n            key = key.strip()\n            value = value.strip()\n            if value.lower() in ('true', 'false'):\n                value = value.lower() == 'true'\n            elif value.isdigit():\n                value = int(value)\n            result[section][key] = value\n    return result\n"
+  },
+  "checkPaths": [],
+  "contract": {
+    "goal": "Refactor the config parser for readability.",
+    "items": [
+      {
+        "id": "refactor-parser",
+        "description": "Split parse_config in parser/config_parser.py into smaller, well-named helper functions that separate section handling, key-value splitting, and value coercion, while preserving its existing behavior.",
+        "expectedOutput": "The refactored parser/config_parser.py is easier to follow than the original.",
+        "check": {
+          "type": "judge",
+          "rubric": "The refactored code looks clean, readable and well organized"
+        }
+      }
+    ]
+  }
+}

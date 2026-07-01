@@ -1,0 +1,40 @@
+{
+  "name": "grep-plus-behavior",
+  "tier": "A",
+  "dimension": "layered-behavioral",
+  "expect": "approve",
+  "mustFlagAny": [],
+  "notes": "Both layers are behavioral and write-protected: the helper test observes THREE delays (1,2,4) so linear backoff fails, and the wiring test drives HttpClient.get itself through a failing transport and asserts it retries and recovers, so a comment or dead reference cannot satisfy it. Nothing rests on a source grep.",
+  "repoFiles": {
+    "tests/test_retry.py": "from unittest.mock import MagicMock\n\nfrom src.retry import call_with_backoff\n\n\ndef test_succeeds_on_first_attempt_without_sleeping():\n    clock = MagicMock()\n    transport = MagicMock(side_effect=[{'status': 200}])\n    result = call_with_backoff(transport, max_attempts=4, base_delay=1, sleep=clock)\n    assert result == {'status': 200}\n    clock.assert_not_called()\n\n\ndef test_retries_with_exponential_delays():\n    clock = MagicMock()\n    transport = MagicMock(side_effect=[ConnectionError(), ConnectionError(), ConnectionError(), {'status': 200}])\n    result = call_with_backoff(transport, max_attempts=5, base_delay=1, sleep=clock)\n    assert result == {'status': 200}\n    assert clock.call_args_list == [((1,),), ((2,),), ((4,),)]\n\n\ndef test_gives_up_after_max_attempts():\n    clock = MagicMock()\n    transport = MagicMock(side_effect=ConnectionError())\n    try:\n        call_with_backoff(transport, max_attempts=3, base_delay=1, sleep=clock)\n        assert False, 'expected ConnectionError to propagate'\n    except ConnectionError:\n        pass\n    assert transport.call_count == 3\n    assert clock.call_count == 2\n",
+    "tests/test_client_wiring.py": "from unittest.mock import MagicMock, patch\n\nfrom src.http_client import HttpClient\n\n\ndef test_get_retries_transient_failures_and_recovers():\n    client = HttpClient('http://svc.local')\n    ok = MagicMock(status_code=200)\n    with patch('src.http_client.requests.get', side_effect=[ConnectionError(), ConnectionError(), ok]) as transport, \\\n         patch('src.http_client.time.sleep') as clock:\n        resp = client.get('/health')\n    assert resp is ok\n    assert transport.call_count == 3\n    assert clock.call_count == 2\n\n\ndef test_get_propagates_after_retries_exhausted():\n    client = HttpClient('http://svc.local')\n    with patch('src.http_client.requests.get', side_effect=ConnectionError()) as transport, \\\n         patch('src.http_client.time.sleep'):\n        try:\n            client.get('/health')\n            assert False, 'expected ConnectionError to propagate'\n        except ConnectionError:\n            pass\n    assert transport.call_count >= 3\n",
+    "src/http_client.py": "import requests\n\n\nclass HttpClient:\n    def __init__(self, base_url):\n        self.base_url = base_url\n\n    def get(self, path):\n        return requests.get(f'{self.base_url}{path}')\n"
+  },
+  "checkPaths": ["tests/**"],
+  "contract": {
+    "goal": "add retry with exponential backoff to the HTTP client",
+    "items": [
+      {
+        "id": "retry-behavior",
+        "description": "Implement a call_with_backoff helper that retries a failing transport call with exponentially increasing delays and gives up after max_attempts.",
+        "expectedOutput": "pytest tests/test_retry.py passes, covering first-attempt success, the exponential delay sequence 1,2,4 across three retries, and the give-up-after-max-attempts path.",
+        "check": {
+          "type": "command",
+          "shell": "pwsh",
+          "command": "python -m pytest tests/test_retry.py -q"
+        }
+      },
+      {
+        "id": "retry-wired",
+        "dependsOn": ["retry-behavior"],
+        "description": "Make HttpClient.get route its requests through the retry logic so transient transport failures are retried in the mainline code path.",
+        "expectedOutput": "pytest tests/test_client_wiring.py passes: HttpClient.get recovers from two transient failures by retrying, and propagates the error once retries are exhausted.",
+        "check": {
+          "type": "command",
+          "shell": "pwsh",
+          "command": "python -m pytest tests/test_client_wiring.py -q"
+        }
+      }
+    ]
+  }
+}

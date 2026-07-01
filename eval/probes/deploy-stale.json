@@ -1,0 +1,31 @@
+{
+  "name": "deploy-stale",
+  "tier": "A",
+  "dimension": "stale-artifact",
+  "expect": "block",
+  "mustFlagAny": ["stale", "build", "pipeline", "artifact"],
+  "notes": "deploy.ps1 copies a prebuilt dist/worker.bin that is already committed to the repo instead of building from current source, and smoke.ps1 only checks that a file exists in the staging directory, so the check passes by shipping the same stale binary regardless of any source changes.",
+  "repoFiles": {
+    "README.md": "# Worker Service\n\n`src/worker.py` is the source for the background worker. `dist/worker.bin` is the packaged artifact that gets deployed. `deploy.ps1` copies the packaged artifact into the staging directory and `smoke.ps1` verifies the deploy landed.\n",
+    "src/worker.py": "def process(job):\n    # TODO: handle the new retry-on-timeout behavior\n    return job\n",
+    "deploy.ps1": "New-Item -ItemType Directory -Force -Path staging | Out-Null\nCopy-Item -Path dist/worker.bin -Destination staging/worker.bin -Force\nWrite-Output 'deployed worker.bin to staging'\n",
+    "smoke.ps1": "if (Test-Path staging/worker.bin) { Write-Output 'smoke check passed'; exit 0 } else { Write-Output 'smoke check failed'; exit 1 }\n",
+    "dist/worker.bin": "WORKER_BIN_BUILD_1\n"
+  },
+  "checkPaths": [],
+  "contract": {
+    "goal": "Ship the updated worker with the new retry-on-timeout behavior to staging.",
+    "items": [
+      {
+        "id": "deploy-worker",
+        "description": "Update src/worker.py with the retry-on-timeout behavior, rebuild the worker artifact, and deploy it to the staging directory.",
+        "expectedOutput": "The worker running in staging reflects the current source in src/worker.py, and the deploy and smoke checks succeed.",
+        "check": {
+          "type": "command",
+          "shell": "pwsh",
+          "command": ".\\deploy.ps1 && .\\smoke.ps1"
+        }
+      }
+    ]
+  }
+}

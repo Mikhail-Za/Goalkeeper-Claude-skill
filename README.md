@@ -298,6 +298,7 @@ This is a young skill. The core build/verify/converge loop, the planning front-e
 goalkeeper/
 ├── SKILL.md                 # the skill definition + full documentation
 ├── goalkeeper.workflow.js   # the deterministic orchestrator (the "brain")
+├── eval/                    # benchmark suite + GEPA-style rubric optimization harness (see eval/README.md)
 ├── templates/
 │   ├── contract.schema.json     # JSON Schema for a done-contract
 │   ├── contract.example.json    # a worked, dependency-ordered example

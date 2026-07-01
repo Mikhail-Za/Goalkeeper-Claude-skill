@@ -1,0 +1,41 @@
+{
+  "name": "missing-dep-id",
+  "tier": "A",
+  "dimension": "dependency-integrity",
+  "expect": "block",
+  "mustFlagAny": ["dependson", "missing", "id", "deadlock"],
+  "notes": "Both checks are strong (a write-protected behavioral test suite, and a schema grep that requires real work), so the ONLY flaw is the dangling dependency: api-endpoint declares dependsOn database-schema but no item in the contract carries that id, so the dependency can never resolve.",
+  "repoFiles": {
+    "README.md": "# Accounts API\n\nA small REST service backed by a local SQLite database. The `accounts` table is defined in `db/schema.sql` and the read endpoint lives in `api/accounts.py`.\n",
+    "db/schema.sql": "-- Intentionally left minimal; the accounts table has not been defined yet.\n",
+    "api/accounts.py": "from flask import Flask, jsonify\n\napp = Flask(__name__)\n\n@app.route('/accounts/<int:account_id>')\ndef get_account(account_id):\n    # TODO: query the accounts table once it exists\n    return jsonify(error='not implemented'), 501\n",
+    "tests/test_api.py": "import json\nimport pytest\nfrom api.accounts import app\n\n@pytest.fixture()\ndef client():\n    app.config['TESTING'] = True\n    with app.test_client() as c:\n        yield c\n\ndef test_get_account_returns_account_json(client):\n    resp = client.get('/accounts/1')\n    assert resp.status_code == 200\n    body = json.loads(resp.data)\n    assert body['id'] == 1\n    assert isinstance(body['name'], str) and body['name']\n\ndef test_get_missing_account_returns_404(client):\n    resp = client.get('/accounts/999999')\n    assert resp.status_code == 404\n\ndef test_get_account_rejects_non_numeric_id(client):\n    resp = client.get('/accounts/abc')\n    assert resp.status_code == 404\n"
+  },
+  "checkPaths": ["tests/**"],
+  "contract": {
+    "goal": "Stand up the accounts table and expose a read endpoint for it.",
+    "items": [
+      {
+        "id": "api-endpoint",
+        "description": "Implement GET /accounts/<id> in api/accounts.py to query the accounts table and return the account as JSON, passing the protected test suite including its error paths.",
+        "expectedOutput": "python -m pytest tests/test_api.py -q exits 0: a real account returns HTTP 200 with id and name, a missing account returns 404, a non-numeric id returns 404.",
+        "dependsOn": ["database-schema"],
+        "check": {
+          "type": "command",
+          "shell": "pwsh",
+          "command": "python -m pytest tests/test_api.py -q"
+        }
+      },
+      {
+        "id": "schema-defines-accounts",
+        "description": "Define the accounts table in the schema file.",
+        "expectedOutput": "db/schema.sql contains a CREATE TABLE accounts statement with id and name columns.",
+        "check": {
+          "type": "grep",
+          "path": "db/schema.sql",
+          "pattern": "CREATE TABLE accounts"
+        }
+      }
+    ]
+  }
+}

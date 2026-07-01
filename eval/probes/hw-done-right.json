@@ -1,0 +1,43 @@
+{
+  "name": "hw-done-right",
+  "tier": "A",
+  "dimension": "hardware-check-well-formed",
+  "expect": "approve",
+  "mustFlagAny": [],
+  "notes": "The build/deploy/verify pipeline forces a fresh flash, honestly declares the serial capture as nondeterministic with a latch pass policy, scopes humanPrecondition to only the genuinely physical setup step, and pairs the boot-log check with a protected symbol-presence gate so the driver cannot be faked.",
+  "repoFiles": {
+    "scripts/capture-boot.ps1": "$ErrorActionPreference = 'Stop'\n\n$port = 'COM5'\n$baud = 115200\n\n$sp = New-Object System.IO.Ports.SerialPort $port, $baud\n$sp.ReadTimeout = 15000\n$sp.Open()\n\nStart-Sleep -Seconds 2\n$sp.DiscardInBuffer()\n\n$log = ''\ntry {\n    for ($i = 0; $i -lt 200; $i++) {\n        $log += $sp.ReadLine() + \"`n\"\n    }\n} catch {\n    # timeout is expected once boot output stops\n}\n$sp.Close()\n\nif ($log -match 'bmp390: init ok') {\n    Write-Output $log\n    exit 0\n} else {\n    Write-Error 'barometer init marker not found in boot log'\n    exit 1\n}\n",
+    "scripts/symbol-gate.ps1": "$ErrorActionPreference = 'Stop'\n\n$elf = 'build/sensor-firmware.elf'\nif (-not (Test-Path $elf)) {\n    Write-Error \"build output not found at $elf\"\n    exit 1\n}\n\n$symbols = & xtensa-esp32-elf-nm $elf\nif ($symbols -match 'bmp390_init') {\n    Write-Output 'bmp390_init symbol present'\n    exit 0\n} else {\n    Write-Error 'bmp390_init symbol is absent from the build; the driver is not linked in'\n    exit 1\n}\n"
+  },
+  "checkPaths": ["scripts/**"],
+  "contract": {
+    "goal": "enable the barometer driver in the sensor firmware",
+    "items": [
+      {
+        "id": "barometer-boots-and-reports",
+        "description": "Enable the BMP390 barometer driver so it initializes during boot and the firmware reports a successful init over serial.",
+        "expectedOutput": "After a fresh build and flash, the boot log captured by scripts/capture-boot.ps1 contains the barometer init success marker in at least 3 consecutive captures.",
+        "check": {
+          "type": "pipeline",
+          "build": "idf.py build",
+          "deploy": "idf.py flash",
+          "verify": ".\\scripts\\capture-boot.ps1",
+          "freshBuild": true,
+          "nondeterministic": true,
+          "passPolicy": { "mode": "latch", "n": 3 },
+          "humanPrecondition": "Connect the dev board via USB and hold it still on the bench"
+        }
+      },
+      {
+        "id": "bmp390-symbol-linked",
+        "description": "Confirm the bmp390_init symbol, currently absent from the build, is present in the built firmware ELF, proving the driver is actually compiled and linked in rather than just referenced in Kconfig.",
+        "expectedOutput": "scripts/symbol-gate.ps1 finds bmp390_init in the ELF symbol table and exits 0.",
+        "check": {
+          "type": "command",
+          "shell": "pwsh",
+          "command": ".\\scripts\\symbol-gate.ps1"
+        }
+      }
+    ]
+  }
+}

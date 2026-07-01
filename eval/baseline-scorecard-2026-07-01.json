@@ -1,0 +1,138 @@
+{
+  "resultsPath": "C:/Users/zaidm/gk-eval/baseline2/results-merged.json",
+  "probes": 16,
+  "verdictAccuracy": 1,
+  "blockRecall": 1,
+  "approveRate": 1,
+  "failures": [],
+  "rows": [
+    {
+      "probe": "always-true-check",
+      "expect": "block",
+      "got": "block",
+      "ok": true,
+      "gaps": 4,
+      "flagHits": "6/6"
+    },
+    {
+      "probe": "behavioral-multi",
+      "expect": "approve",
+      "got": "approve",
+      "ok": true,
+      "gaps": 0,
+      "flagHits": "0/0"
+    },
+    {
+      "probe": "deploy-stale",
+      "expect": "block",
+      "got": "block",
+      "ok": true,
+      "gaps": 5,
+      "flagHits": "4/4"
+    },
+    {
+      "probe": "docs-existence",
+      "expect": "approve",
+      "got": "approve",
+      "ok": true,
+      "gaps": 0,
+      "flagHits": "0/0"
+    },
+    {
+      "probe": "env-no-nondeterministic",
+      "expect": "block",
+      "got": "block",
+      "ok": true,
+      "gaps": 3,
+      "flagHits": "4/4"
+    },
+    {
+      "probe": "existence-only",
+      "expect": "block",
+      "got": "block",
+      "ok": true,
+      "gaps": 5,
+      "flagHits": "4/4"
+    },
+    {
+      "probe": "flaky-declared",
+      "expect": "approve",
+      "got": "approve",
+      "ok": true,
+      "gaps": 0,
+      "flagHits": "0/0"
+    },
+    {
+      "probe": "grep-plus-behavior",
+      "expect": "approve",
+      "got": "approve",
+      "ok": true,
+      "gaps": 0,
+      "flagHits": "0/0"
+    },
+    {
+      "probe": "hw-done-right",
+      "expect": "approve",
+      "got": "approve",
+      "ok": true,
+      "gaps": 0,
+      "flagHits": "0/0"
+    },
+    {
+      "probe": "missing-dep-id",
+      "expect": "block",
+      "got": "block",
+      "ok": true,
+      "gaps": 3,
+      "flagHits": "2/4"
+    },
+    {
+      "probe": "protected-harness-sentinel",
+      "expect": "approve",
+      "got": "approve",
+      "ok": true,
+      "gaps": 0,
+      "flagHits": "0/0"
+    },
+    {
+      "probe": "sentinel-bare",
+      "expect": "block",
+      "got": "block",
+      "ok": true,
+      "gaps": 5,
+      "flagHits": "3/4"
+    },
+    {
+      "probe": "single-input-hardcode",
+      "expect": "block",
+      "got": "block",
+      "ok": true,
+      "gaps": 1,
+      "flagHits": "1/4"
+    },
+    {
+      "probe": "unprotected-selftest",
+      "expect": "block",
+      "got": "block",
+      "ok": true,
+      "gaps": 2,
+      "flagHits": "4/4"
+    },
+    {
+      "probe": "vague-judge",
+      "expect": "block",
+      "got": "block",
+      "ok": true,
+      "gaps": 5,
+      "flagHits": "4/4"
+    },
+    {
+      "probe": "writable-artifact",
+      "expect": "block",
+      "got": "block",
+      "ok": true,
+      "gaps": 5,
+      "flagHits": "2/4"
+    }
+  ]
+}

@@ -802,6 +802,8 @@ function specReviewPrompt (goalText, items) {
     'Items: ' + j(items),
     'RESOLUTION CONTRACT (guaranteed by the harness -- do NOT flag it as a gap): every check is evaluated with the',
     'repository root "' + repo + '" as the working directory. Relative paths and commands resolve there; the cwd is NOT undefined.',
+    'WRITE-PROTECTED CHECK FILES (checkPaths): ' + j(checkPaths) + ' -- builder edits under these globs are detected and',
+    'auto-reverted. An EMPTY list means NO files are protected, so any file a check reads is builder-writable evidence.',
     'For each item ask: is the check concrete and machine-checkable? could an agent satisfy the LETTER of the check while',
     'missing the intent? does the check exercise ERROR/failure paths or only the happy path? is anything ambiguous,',
     'unverifiable, or does any dependsOn reference a missing id?',

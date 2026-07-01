@@ -1,0 +1,29 @@
+For each item ask: is the check concrete and machine-checkable? could an agent satisfy the LETTER of the check while
+missing the intent? does the check exercise ERROR/failure paths or only the happy path? is anything ambiguous,
+unverifiable, or does any dependsOn reference a missing id?
+NON-DETERMINISM: if a check's pass can depend on an external event or timing (not just the code), it MUST declare
+nondeterministic:true with a passPolicy; an environment-dependent check WITHOUT that declaration IS a blocking gap,
+because the loop would treat an environmental miss as a real code failure. BUILD/DEPLOY: a check that builds then
+deploys/measures should short-circuit on build failure (a {type:"pipeline"} check does); flag any deploy/measure
+check that could act on a stale artifact after a failed or no-op build.
+HUMAN PRECONDITION: do NOT invent a check.humanPrecondition for a SOFTWARE check the engine can run unattended; it is
+ONLY for a genuine physical/hardware action a person must perform (and an item that has one is NOT a gap for that reason).
+DISTRUST THE CHECK ITSELF (a check can be WRONG or GAMEABLE, not just incomplete): for each check ask (a) is it
+CORRECT -- does it actually test the goal, with no inverted/trivial/always-true assertion that would pass buggy code
+or fail correct code? and (b) is it CHEAT-RESISTANT -- would a trivial cheat pass it (hardcoding the exact expected
+output, special-casing the check's specific inputs, stubbing a constant return, exit 0/no-op, writing an expected
+sentinel without doing the work)? A check a cheat can pass is a BLOCKING gap; it must exercise behavior a cheat cannot
+fake (multiple/edge inputs, properties, round-trips, real error paths). MECHANICAL-ONLY: prefer objective pass/fail or
+numeric checks; a "judge"/subjective check with a vague "looks good" rubric is a blocking gap unless its rubric is
+concrete and falsifiable.
+LOG/SERIAL SENTINELS ARE ALWAYS GAMEABLE (a class rule, not case-by-case): a check that greps a log, serial capture,
+or console output for a LITERAL STRING is satisfiable by one hardcoded print statement with ZERO real work, no matter
+how specific the string is -- so a more-specific sentinel string is NEVER an acceptable fix for this gap. Such a check
+is a blocking gap UNLESS it is paired with a companion gate a print cannot fake, e.g.: (a) a LINKED-SYMBOL assertion
+(run nm/objdump on the built binary for a symbol only the real implementation introduces -- and note the contract must
+have verified that symbol is ABSENT from the current pre-work build, or the gate proves nothing), (b) a behavioral
+host test that exercises the real logic, or (c) a numeric/property assertion derived from real behavior. When you flag
+this gap, SAY so in these terms (sentinel-plus-symbol-gate or behavioral companion), so the author fixes the check
+CLASS instead of re-wording the sentinel. EXCEPTION: a sentinel printed by code the BUILDER CANNOT MODIFY (a
+write-protected test/harness under checkPaths with allowTestEdit=false, whose edits are auto-reverted) is not
+gameable by a builder print statement -- judge those under the ordinary trivial-cheat test above, not this class rule.

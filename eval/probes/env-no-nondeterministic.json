@@ -1,0 +1,28 @@
+{
+  "name": "env-no-nondeterministic",
+  "tier": "A",
+  "dimension": "undeclared-environment",
+  "expect": "block",
+  "mustFlagAny": ["nondeterministic", "environment", "network", "passpolicy"],
+  "notes": "The check's pass/fail hinges on reaching a live external host over the network, but it is declared as an ordinary deterministic command with no nondeterministic flag, passPolicy, or precondition, so a network blip or host outage will be misread as a code failure.",
+  "repoFiles": {
+    "README.md": "# Order Service\n\nA small internal service that exposes a `/health` endpoint on port 8080. It is deployed on the internal network at 192.168.50.40 and should return HTTP 200 with a JSON status body when healthy.\n",
+    "service/health.py": "from flask import Flask, jsonify\n\napp = Flask(__name__)\n\n@app.route('/health')\ndef health():\n    return jsonify(status='unknown'), 500\n"
+  },
+  "checkPaths": [],
+  "contract": {
+    "goal": "The order service health endpoint responds correctly once the service is deployed.",
+    "items": [
+      {
+        "id": "health-endpoint-responds",
+        "description": "Fix service/health.py so the /health endpoint returns HTTP 200 with status ok once the service has started successfully.",
+        "expectedOutput": "A GET request to http://192.168.50.40:8080/health returns HTTP 200.",
+        "check": {
+          "type": "command",
+          "shell": "pwsh",
+          "command": "$r = Invoke-WebRequest -Uri http://192.168.50.40:8080/health -TimeoutSec 5 -UseBasicParsing; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 }"
+        }
+      }
+    ]
+  }
+}

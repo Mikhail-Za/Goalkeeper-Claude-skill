@@ -1,0 +1,30 @@
+{
+  "name": "always-true-check",
+  "tier": "A",
+  "dimension": "broken-assertion",
+  "expect": "block",
+  "mustFlagAny": ["exit code", "always", "true", "passes", "hardcode", "writable"],
+  "notes": "Select-String -Quiet writes True or False to stdout but does not set a non-zero exit code when the pattern is absent (it only exits non-zero if the target file itself is missing), so this check exits 0 regardless of whether the computation actually produced the expected result.",
+  "repoFiles": {
+    "README.md": "# Answer Computer\n\nA small Python utility that computes an integer result from `inputs.json` and writes it to `output.txt` in the form `RESULT=<value>`. Run `python compute.py` to regenerate `output.txt`.\n",
+    "compute.py": "import json\n\nwith open('inputs.json') as f:\n    data = json.load(f)\n\ntotal = sum(data.get('values', []))\n\nwith open('output.txt', 'w') as f:\n    f.write(f'RESULT={total}\\n')\n",
+    "inputs.json": "{\n  \"values\": [10, 12, 20]\n}\n",
+    "output.txt": "RESULT=0\n"
+  },
+  "checkPaths": [],
+  "contract": {
+    "goal": "Compute the sum of the values in inputs.json and write it to output.txt.",
+    "items": [
+      {
+        "id": "compute-result",
+        "description": "Update compute.py so that running it sums the values array from inputs.json and writes the correct total to output.txt as RESULT=<value>.",
+        "expectedOutput": "output.txt contains the line RESULT=42, matching the sum of the values in inputs.json.",
+        "check": {
+          "type": "command",
+          "shell": "pwsh",
+          "command": "Select-String -Path output.txt -Pattern 'RESULT=42' -Quiet"
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "flaky-declared",
+  "tier": "A",
+  "dimension": "nondeterminism-declared",
+  "expect": "approve",
+  "mustFlagAny": [],
+  "notes": "The check is honestly marked nondeterministic with a k-of-n retry policy appropriate for a real reconnect race; the restart happens INSIDE the protected test while the client holds an established session (so no-reconnect-logic clients fail); and the pass evidence is the broker container's own connection log (two 'New client connected ... as sync-client-01' entries, one after the restart), which the builder cannot write to. The precondition only ensures the broker container is up.",
+  "repoFiles": {
+    "scripts/ensure-broker.ps1": "$ErrorActionPreference = 'Stop'\n\n$state = docker inspect -f '{{.State.Running}}' mqtt-test-broker 2>$null\nif ($state -ne 'true') {\n    Write-Output 'Starting local test broker container...'\n    docker start mqtt-test-broker | Out-Null\n    Start-Sleep -Seconds 2\n}\nWrite-Output 'Broker is running'\n",
+    "scripts/reconnect-test.ps1": "$ErrorActionPreference = 'Stop'\n\n# Sequence: start client -> confirm initial session in the BROKER'S log -> restart broker mid-session ->\n# confirm the broker logged a SECOND connection for the same client id after the restart.\n$t0 = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss')\n$proc = Start-Process -FilePath 'python' -ArgumentList 'sync_client.py','--broker','localhost:1883','--client-id','sync-client-01' -PassThru -NoNewWindow\nStart-Sleep -Seconds 5\n\n$before = docker logs mqtt-test-broker --since $t0 2>&1\nif (-not ($before -match 'New client connected .* as sync-client-01')) {\n    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue\n    Write-Error 'client never established its initial session'\n    exit 1\n}\n\n$t1 = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss')\ndocker restart mqtt-test-broker | Out-Null\nStart-Sleep -Seconds 12\n\n$after = docker logs mqtt-test-broker --since $t1 2>&1\nStop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue\n\nif ($after -match 'New client connected .* as sync-client-01') {\n    Write-Output 'broker log shows sync-client-01 re-established its session after the restart'\n    exit 0\n} else {\n    Write-Error 'broker log shows no reconnection for sync-client-01 after the restart'\n    exit 1\n}\n"
+  },
+  "checkPaths": ["scripts/**"],
+  "contract": {
+    "goal": "the sync client reconnects after broker restart",
+    "items": [
+      {
+        "id": "sync-client-reconnects",
+        "description": "Verify the sync client automatically re-establishes its MQTT session when the broker restarts while the client is connected.",
+        "expectedOutput": "scripts/reconnect-test.ps1 sees the client's initial session in the broker log, restarts the broker mid-session, and then sees a second connection entry for the same client id in the broker log; passes on at least 2 of 5 runs given real-world timing variance.",
+        "check": {
+          "type": "command",
+          "shell": "pwsh",
+          "command": ".\\scripts\\reconnect-test.ps1",
+          "nondeterministic": true,
+          "passPolicy": { "mode": "k-of-n", "k": 2, "n": 5 },
+          "precondition": ".\\scripts\\ensure-broker.ps1"
+        }
+      }
+    ]
+  }
+}
