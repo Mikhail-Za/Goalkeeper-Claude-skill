@@ -4,7 +4,7 @@ Goalkeeper is designed to run unattended, and that makes it a natural fit for CI
 
 This guide covers how to wire that up. A ready-to-adapt GitHub Actions workflow lives alongside it at [`.github/workflows/goalkeeper.yml.example`](../.github/workflows/goalkeeper.yml.example).
 
-> **A note on certainty.** Goalkeeper's own behavior (its state files, its escalation contract, its caps and denylist) is documented here from the skill itself and is accurate. The surrounding Claude Code headless invocation (the exact `claude -p` flags, the install command, the GitHub Action) is confirmed against the Claude Code docs as of June 2026, but Claude Code moves fast. Anything explicitly marked **illustrative, verify before use** should be checked against `claude --help` and the current docs in your runner before you rely on it.
+> **A note on certainty.** Goalkeeper's own behavior (its state files, its escalation contract, its caps and denylist) is documented here from the skill itself and is accurate. The headless invocation below was **confirmed by a live end-to-end run** (2026-07-02, Claude Code 2.1.198): the workflow runtime launched under `claude -p`, the least-privilege `--allowedTools` set sufficed with no permission wedge, the token cap held, and the halt path wrote `ESCALATION.md` exactly as the wrapper contract expects. Claude Code moves fast, so re-check `claude --help` in your runner if versions have moved on, but this recipe is no longer speculative.
 
 ---
 
@@ -104,25 +104,33 @@ A few things to keep right in that prompt:
 - **`mode: build`, `autonomy: envelope`.** Build mode is the hardened path. Envelope autonomy runs unattended and halts only on the hard triggers, which is exactly what you want in CI. (Leash mode pauses for per-round approval and is not appropriate for an unattended run.)
 - **A `maxTokens` cap is mandatory.** See Caveats. Set it in the prompt as shown, or via the skill's `caps.maxTokens`.
 
-### The `claude -p` flags (illustrative, verify before use)
+### The `claude -p` flags (confirmed by a live run, 2026-07-02)
 
 The shape of the headless command is:
 
 ```bash
-# ILLUSTRATIVE. Confirm exact flags with `claude --help` in your runner before relying on this.
+# CONFIRMED end-to-end on Claude Code 2.1.198 (Windows runner, user-level skill install).
 claude -p "<the prompt above>" \
-  --allowedTools "Read,Edit,Write,Bash,Workflow" \
+  --allowedTools "Read,Edit,Write,Bash,Glob,Grep,Workflow,TaskCreate,TaskUpdate,ToolSearch" \
   --output-format text
 ```
 
-Two flag concerns are worth calling out explicitly, because getting them wrong is the most likely way a headless run wedges:
+A wrap-safe variant that avoids shell-quoting a long prompt (and survives terminal line-wrapping): commit the prompt to a file and pipe it in. `claude -p` reads the prompt from stdin:
 
-- **Permission prompts must not block.** A fully headless run has no human to approve tool calls, so the agents Goalkeeper spawns (builder, verifier, bookkeeper, planner, critic) must be pre-authorized or they will hang waiting for input that never comes. There are two documented approaches, and **which one you need is the part to verify**:
-  - `--allowedTools "Read,Edit,Write,Bash,Workflow"` pre-approves a specific tool set. This is the least-privilege option, but the exact tool list Goalkeeper's sub-agents require (and the exact `Bash(...)` command patterns) is **illustrative here, verify before use** by doing a dry run and seeing what it asks for.
-  - `--dangerously-skip-permissions` (equivalently `--permission-mode bypassPermissions`) disables permission prompts entirely. It is the blunt instrument and should only ever be used in an **isolated, throwaway CI runner**, never on a developer machine or a runner with credentials or network you care about. Whether Goalkeeper's nested workflow agents actually need this (versus a sufficiently broad `--allowedTools`) is the specific thing to test for your setup. **Illustrative, verify before use.**
-- **There is no `--max-tokens` CLI flag.** Token budgeting for the *build loop* is not a Claude Code CLI flag; it is Goalkeeper's own `caps.maxTokens`, which you set in the prompt / skill args (above). Do not look for a `claude -p --max-tokens` flag to cap the run; the budget backstop that actually stops a runaway loop is Goalkeeper's. (Claude Code does have a `--max-turns` flag, but that bounds conversation turns, not the workflow's token spend, and is not the right lever here.)
+```bash
+cat ci-prompt.txt | claude -p \
+  --allowedTools "Read,Edit,Write,Bash,Glob,Grep,Workflow,TaskCreate,TaskUpdate,ToolSearch" \
+  --output-format text
+```
 
-The `--allowedTools` spelling is camelCase and is confirmed; `--dangerously-skip-permissions` and `--permission-mode bypassPermissions` are confirmed; `--output-format text` is confirmed. What is **not** confirmed and must be tested is *the exact set of tools / which permission approach Goalkeeper's nested agents require in your runner*. Start with a dry run on a scratch branch.
+What the live confirmation run established:
+
+- **The dynamic-workflows runtime works headless.** The goalkeeper Workflow launched under `claude -p`, spawned its agents, and enforced its caps (the run reported ~123k tokens against a 150k `caps.maxTokens` ceiling).
+- **The least-privilege `--allowedTools` set above is sufficient.** No permission wedge, no hang, and no `--dangerously-skip-permissions` needed. The blunt fallback (`--dangerously-skip-permissions`, equivalently `--permission-mode bypassPermissions`) remains available for an **isolated, throwaway CI runner** whose environment differs, and should never be used on a developer machine.
+- **The wrapper contract holds.** The confirmation run halted at spec-review (`contract-incomplete`), and the halt produced exactly what this guide promises: `ESCALATION.md` on disk naming the gaps, a clean tree, no commits, and durable state in `plan.json`. Build-or-escalate is real headless, in both directions.
+- **There is no `--max-tokens` CLI flag.** Token budgeting for the *build loop* is not a Claude Code CLI flag; it is Goalkeeper's own `caps.maxTokens`, set in the prompt / skill args (above). (Claude Code's `--max-turns` bounds conversation turns, not workflow token spend, and is not the right lever here.)
+
+Environments vary (auth method, OS, plan tier), so a first dry run on a scratch branch is still good hygiene, but the default expectation is now that the flag set above works as written.
 
 ---
 

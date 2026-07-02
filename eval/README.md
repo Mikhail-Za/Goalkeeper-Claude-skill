@@ -65,3 +65,9 @@ A baseline failure can mean the probe is wrong rather than the rubric (mis-plant
 a genuine unnoticed gap). First baseline run: adjudicate every failure once, fix probe defects, and only then
 treat the suite as ground truth. Reviewer verdicts also carry some run-to-run variance; near-threshold probes
 deserve a second opinion before being trusted to discriminate.
+
+Live example of that variance: `docs-existence` was approved in the calibrated baseline, but an independent
+headless replicate of the same contract (2026-07-02) blocked it, citing that a three-phrase stub passes the
+grep and that the copyright holder is unspecified. Both verdicts are defensible readings of the rubric; the
+probe sits on the decision boundary by construction. Treat single-run flips on that probe as noise, not
+signal, and prefer repeated runs before drawing conclusions from it.

@@ -94,17 +94,17 @@ jobs:
       #    contractPath (absolute path, where `${{ github.workspace }}` is the
       #    checkout root), sets build/envelope, and sets the maxTokens cap.
       #
-      #    ILLUSTRATIVE FLAGS: the permission handling is the part most likely to
-      #    need adjustment. A fully headless run has no human to approve tool
+      #    PERMISSION FLAGS: a fully headless run has no human to approve tool
       #    calls, so Goalkeeper's nested agents must be pre-authorized or they
-      #    will hang. Two documented approaches, pick and VERIFY one:
-      #      (a) --allowedTools "<list>"  (least privilege; verify the exact list)
-      #      (b) --dangerously-skip-permissions  (blunt; isolated runners ONLY)
-      #    `--dangerously-skip-permissions` is acceptable here because a GitHub
-      #    runner is ephemeral and isolated, but confirm whether the broad
-      #    --allowedTools set is enough first. There is NO `--max-tokens` CLI
-      #    flag; the token ceiling is Goalkeeper's caps.maxTokens, set in the
-      #    prompt below.
+      #    will hang. CONFIRMED by a live headless run (2026-07-02, Claude Code
+      #    2.1.198): the least-privilege set
+      #      --allowedTools "Read,Edit,Write,Bash,Glob,Grep,Workflow,TaskCreate,TaskUpdate,ToolSearch"
+      #    is sufficient: the workflow launched headless, its agents ran, the
+      #    caps held, and the halt path wrote ESCALATION.md, all WITHOUT
+      #    --dangerously-skip-permissions. That blunt fallback remains an option
+      #    on an ephemeral isolated runner if your environment differs. There is
+      #    NO `--max-tokens` CLI flag; the token ceiling is Goalkeeper's
+      #    caps.maxTokens, set in the prompt below.
       - name: Run Goalkeeper
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -120,9 +120,10 @@ jobs:
           defaults. Run unattended; do not pause for approval. If the run cannot \
           converge, let Goalkeeper write ESCALATION.md and stop." \
             --output-format text \
-            --dangerously-skip-permissions
-          #   ^ ILLUSTRATIVE permission flag, see note above. Prefer a verified
-          #     --allowedTools "Read,Edit,Write,Bash,Workflow" if it suffices.
+            --allowedTools "Read,Edit,Write,Bash,Glob,Grep,Workflow,TaskCreate,TaskUpdate,ToolSearch"
+          #   ^ CONFIRMED sufficient by a live headless run (see note above).
+          #     Swap for --dangerously-skip-permissions only if your isolated
+          #     runner turns out to need it.
 
       # 5) Decide the outcome from Goalkeeper's on-disk state, NOT the exit code.
       #    The halt signal is the presence of <repo>/.goalkeeper/ESCALATION.md.
